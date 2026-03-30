@@ -1,4 +1,4 @@
-# Kodi-GDS
+# GDS for Kodi
 
 FlaskFarm에서 GDS의 파일 목록을 Kodi로 전송하고, 재생 요청 시 FF 서버의 `ffmpeg`로 트랜스코딩하여 전달하기 위한 플러그인입니다.
 
@@ -57,4 +57,3 @@ FlaskFarm에서 GDS의 파일 목록을 Kodi로 전송하고, 재생 요청 시 
 * PLEX의 DB를 kodi용에 맞춰서 재조정.
 * PLEX DB경로를 입력하신 후 설정저장, 이후 가져오기 하시면 됩니다.
 * 메타데이터/썸네일 안쓰시는 분께는 필요 없는 기능입니다.
-

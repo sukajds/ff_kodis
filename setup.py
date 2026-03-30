@@ -5,7 +5,7 @@ setting = {
     'home_module': 'setting',
     'menu': {
         'uri': __package__,
-        'name': 'Kodi-GDS',
+        'name': 'GDS for Kodi',
         'list': [
             {
                 'uri': 'setting',
