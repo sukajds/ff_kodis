@@ -36,7 +36,7 @@
       {{ macros.setting_input_text_and_buttons(
         'ffmpeg_path',
         'ffmpeg 경로',
-        [['ffmpeg_version_btn', '버전 확인'], ['transcode_capabilities_btn', '트랜스코딩 확인']],
+        [['ffmpeg_version_btn', '버전 확인']],
         value=arg['ffmpeg_path'],
         desc=['예: /usr/bin/ffmpeg 또는 컨테이너 내부 ffmpeg 경로']
       ) }}
@@ -85,11 +85,6 @@ function saveGdsPathSelection() {
 $("body").on('click', '#ffmpeg_version_btn', function(e){
   e.preventDefault();
   globalSendCommand('ffmpeg_version');
-});
-
-$("body").on('click', '#transcode_capabilities_btn', function(e){
-  e.preventDefault();
-  globalSendCommand('transcode_capabilities');
 });
 
 $("body").on('click', '#test_transcode_encoder_btn', function(e){
