@@ -591,7 +591,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         items = []
         prefetch_series_paths = []
         for folder_rel in self._recent_folder_paths(client_id, 20):
-            target_path = os.path.join(root, folder_rel.replace('/', os.sep))
+            target_path = self._resolve_recent_folder_target(root, folder_rel)
             if not os.path.isdir(target_path):
                 continue
             entry = type('RecentEntry', (), {
@@ -1284,7 +1284,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return redirect(self._make_metadata_proxy_url(req, image_url))
 
     def _resolve_target_path(self, relative_path=''):
-        root = self._effective_gds_root()
+        root = os.path.abspath(P.ModelSetting.get('gds_path') or '')
         if not root:
             raise Exception('gds_path is empty')
         if not self._run_with_timeout('gds_root_exists', lambda: os.path.exists(root), timeout_seconds=5):
@@ -1294,16 +1294,16 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             raise Exception('invalid path')
         return root, candidate
 
-    def _effective_gds_root(self):
-        configured = os.path.abspath(P.ModelSetting.get('gds_path') or '')
-        if not configured:
-            return configured
-        if os.path.basename(os.path.normpath(configured)).upper() == 'VIDEO':
-            return configured
-        video_root = os.path.join(configured, 'VIDEO')
-        if self._run_with_timeout('gds_video_root_exists', lambda: os.path.isdir(video_root), timeout_seconds=5):
-            return os.path.abspath(video_root)
-        return configured
+    def _resolve_recent_folder_target(self, root, folder_rel):
+        normalized_rel = str(folder_rel or '').replace('\\', '/').strip().strip('/')
+        direct_target = os.path.join(root, normalized_rel.replace('/', os.sep))
+        if self._run_with_timeout('recent_direct_target_isdir', lambda: os.path.isdir(direct_target), timeout_seconds=5):
+            return direct_target
+        if os.path.basename(os.path.normpath(root)).upper() != 'VIDEO':
+            video_target = os.path.join(root, 'VIDEO', normalized_rel.replace('/', os.sep))
+            if self._run_with_timeout('recent_video_target_isdir', lambda: os.path.isdir(video_target), timeout_seconds=5):
+                return video_target
+        return direct_target
 
     def _gds_tool_db_path(self):
         return os.path.join(F.config['path_data'], 'db', 'gds_tool.db')
