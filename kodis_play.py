@@ -110,6 +110,16 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             raise payload
         return payload
 
+    def _req_bool(self, req, key, default=False):
+        value = ''
+        if hasattr(req, 'args'):
+            value = req.args.get(key, '')
+        if value in (None, '') and hasattr(req, 'form'):
+            value = req.form.get(key, '')
+        if value in (None, ''):
+            return default
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on', 'y')
+
     def _remember_base_url(self, base):
         normalized = str(base or '').strip().rstrip('/')
         if not normalized:

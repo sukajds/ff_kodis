@@ -89,16 +89,6 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
             P.logger.error(traceback.format_exc())
             return jsonify({'ret': 'exception', 'msg': str(e)}), 500
 
-    def _req_bool(self, req, key, default=False):
-        value = None
-        if hasattr(req, 'args'):
-            value = req.args.get(key)
-        if (value is None or value == '') and hasattr(req, 'form'):
-            value = req.form.get(key)
-        if value is None or value == '':
-            return default
-        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
-
     def _generate_password(self):
         generated = secrets.token_urlsafe(12)
         P.ModelSetting.set('access_password', generated)
