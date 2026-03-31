@@ -36,23 +36,7 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
     def process_command(self, command, arg1, arg2, arg3, req):
         self._remember_base_url_from_req(req)
         try:
-            req_path = getattr(req, 'path', '')
-            req_args = dict(req.args) if hasattr(req, 'args') else {}
-            req_form = dict(req.form) if hasattr(req, 'form') else {}
-            self._diagnostic_log(f'setting.process_command command={command} path={req_path} args={req_args} form={req_form}')
-            P.logger.warning(
-                'kodis_setting process_command command=%s arg1=%s arg2=%s arg3=%s path=%s args=%s form=%s',
-                command,
-                arg1,
-                arg2,
-                arg3,
-                req_path,
-                req_args,
-                req_form,
-            )
             if command in ('list_root', 'list'):
-                self._diagnostic_log(f'setting.process_command list command={command} gds_path={P.ModelSetting.get("gds_path")}')
-                P.logger.warning('kodis_setting list_root requested gds_path=%s', P.ModelSetting.get('gds_path'))
                 return jsonify(self._list_items(req))
             if command == 'generate_password':
                 return jsonify(self._generate_password())
@@ -64,11 +48,7 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
                 return jsonify(self._test_transcode_encoder())
             response = self._process_kodis_command(command, req)
             if response is not None:
-                self._diagnostic_log(f'setting.process_command delegated command={command}')
-                P.logger.warning('kodis_setting delegated command=%s to KodisPlayMixin', command)
                 return response
-            self._diagnostic_log(f'setting.process_command unknown command={command}')
-            P.logger.warning('kodis_setting unknown command=%s path=%s args=%s form=%s', command, req_path, req_args, req_form)
             return jsonify({'ret': 'warning', 'msg': f'Unknown command: {command}'})
         except Exception as e:
             P.logger.error(f'Exception:{str(e)}')

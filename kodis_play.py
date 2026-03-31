@@ -24,8 +24,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     recent_virtual_path = '__recent__'
     hls_jobs = {}
     hls_lock = threading.Lock()
-    auth_sessions = {}
-    auth_lock = threading.Lock()
     encoder_probe_cache = {}
     vod_jobs = {}
     vod_lock = threading.Lock()
@@ -40,7 +38,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     segment_duration = 2
     vod_prefetch_count = 4
     vod_initial_segments = 3
-    auth_session_ttl = 60 * 60 * 12
     resolution_map = {
         '1080p': {'width': 1920, 'height': 1080, 'bitrate': '6M', 'maxrate': '7M', 'bufsize': '12M'},
         '720p': {'width': 1280, 'height': 720, 'bitrate': '4M', 'maxrate': '5M', 'bufsize': '8M'},
@@ -399,34 +396,14 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 P.logger.warning(f'Auto metadata item failed id={fp_item_id} path={gds_path}: {str(e)}')
 
     def _process_kodis_command(self, command, req):
-        req_path = getattr(req, 'path', '')
-        req_args = dict(req.args) if hasattr(req, 'args') else {}
-        req_form = dict(req.form) if hasattr(req, 'form') else {}
-        self._diagnostic_log(f'process_command command={command} path={req_path} args={req_args} form={req_form}')
-        P.logger.warning(
-            'kodis_play _process_kodis_command command=%s path=%s args=%s form=%s',
-            command,
-            req_path,
-            req_args,
-            req_form,
-        )
         if command in ('list', 'list_root'):
-            self._diagnostic_log(f'process_command list dispatch command={command} gds_path={P.ModelSetting.get("gds_path")}')
-            P.logger.warning('kodis_play handling list command=%s gds_path=%s', command, P.ModelSetting.get('gds_path'))
             return jsonify(self._list_items(req))
         if command == 'hls_status':
             return jsonify(self._hls_status(req))
-        self._diagnostic_log(f'process_command unhandled command={command}')
-        P.logger.warning('kodis_play unhandled command=%s', command)
         return None
 
     def _process_kodis_api(self, sub, req):
-        req_path = getattr(req, 'path', '')
-        req_args = dict(req.args) if hasattr(req, 'args') else {}
-        req_form = dict(req.form) if hasattr(req, 'form') else {}
-        self._diagnostic_log(f'process_api sub={sub} path={req_path} args={req_args} form={req_form}')
         if sub == 'list':
-            self._diagnostic_log(f'process_api list dispatch gds_path={P.ModelSetting.get("gds_path")}')
             return jsonify(self._list_items(req))
         if sub == 'play':
             return self._play(req)
@@ -1550,23 +1527,11 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         recent_sort_mode = (req.args.get('recent_sort_mode') or 'latest').strip().lower()
         metadata_enabled = self._req_bool(req, 'metadata_enabled', True)
         client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
-        self._diagnostic_log(
-            'list_items start path={} recent_sort_mode={} metadata_enabled={} client_id={} gds_path={}'.format(
-                relative_path,
-                recent_sort_mode,
-                metadata_enabled,
-                client_id,
-                P.ModelSetting.get('gds_path'),
-            )
-        )
         if str(relative_path or '').strip().strip('/') == self.recent_virtual_path:
             root, _ = self._resolve_target_path('')
-            self._diagnostic_log(f'list_items recent virtual path root={root}')
             return self._list_recent_items(req, root, metadata_enabled, client_id)
         root, target = self._resolve_target_path(relative_path)
-        self._diagnostic_log(f'list_items resolved root={root} target={target}')
         if not self._run_with_timeout('list_target_isdir', lambda: os.path.isdir(target), timeout_seconds=5):
-            self._diagnostic_log(f'list_items target_not_dir target={target}')
             raise Exception('target path is not a directory')
 
         current_rel = os.path.relpath(target, root).replace('\\', '/')
@@ -1579,7 +1544,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry)],
             timeout_seconds=8,
         )
-        self._diagnostic_log(f'list_items scandir_ok current_rel={current_rel} entry_count={len(entries)}')
         if self._is_recent_episode_sort_target(current_rel):
             file_groups = {}
             deduped_entries = []
