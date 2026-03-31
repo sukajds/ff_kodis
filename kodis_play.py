@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import json
 import mimetypes
 import os
@@ -58,6 +58,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         'ffmpeg_path': 'ffmpeg',
         'gds_path': '',
         'access_password': '',
+        'custom_root_enabled': 'False',
+        'custom_root_items': '[]',
         'plex_db_path': '',
         'transcode_codec': 'h264',
         'transcode_h264_encoder': '',
@@ -405,6 +407,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     def _process_kodis_api(self, sub, req):
         if sub == 'list':
             return jsonify(self._list_items(req))
+        if sub == 'search':
+            return jsonify(self._search_items(req))
         if sub == 'play':
             return self._play(req)
         if sub == 'directplay':
@@ -1305,6 +1309,108 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 return video_target
         return direct_target
 
+    def _custom_root_enabled(self):
+        value = str(P.ModelSetting.get('custom_root_enabled') or 'False').strip().lower()
+        return value in ('true', '1', 'yes', 'on', 'y')
+
+    def _custom_root_items(self):
+        raw_value = P.ModelSetting.get('custom_root_items') or '[]'
+        try:
+            data = json.loads(raw_value)
+        except Exception:
+            data = []
+        result = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            path_value = str(item.get('path') or '').strip()
+            if not path_value:
+                continue
+            result.append({
+                'name': str(item.get('name') or '').strip(),
+                'path': path_value,
+            })
+        return result
+
+    def _custom_root_relative_path(self, root, path_value):
+        root_abs = os.path.abspath(root)
+        target_abs = os.path.abspath(str(path_value or '').strip())
+        if not target_abs:
+            return ''
+        try:
+            if os.path.commonpath([root_abs, target_abs]) == root_abs:
+                rel = os.path.relpath(target_abs, root_abs).replace('\\', '/')
+                return '' if rel == '.' else rel.strip('/')
+        except Exception:
+            return None
+
+        if os.path.basename(os.path.normpath(root_abs)).upper() != 'VIDEO':
+            video_root = os.path.join(root_abs, 'VIDEO')
+            try:
+                if os.path.commonpath([video_root, target_abs]) == video_root:
+                    rel = os.path.relpath(target_abs, root_abs).replace('\\', '/')
+                    return '' if rel == '.' else rel.strip('/')
+            except Exception:
+                return None
+        return None
+
+    def _custom_root_display_name(self, item, path_value):
+        display_name = str(item.get('name') or '').strip()
+        if display_name:
+            return display_name
+        normalized = os.path.normpath(str(path_value or '').strip())
+        return os.path.basename(normalized) or normalized
+
+    def _list_custom_root_items(self, req, root, metadata_enabled):
+        items = [{
+            'name': '최근 재생항목',
+            'display_name': '최근 재생항목',
+            'path': self.recent_virtual_path,
+            'is_dir': True,
+            'type': 'dir',
+            'size': 0,
+            'mime': None,
+            'extension': '',
+            'playable': False,
+        }]
+        prefetch_series_paths = []
+        for config_item in self._custom_root_items():
+            relative_path = self._custom_root_relative_path(root, config_item.get('path', ''))
+            if relative_path is None:
+                continue
+            target_path = os.path.abspath(os.path.join(root, relative_path.replace('/', os.sep)))
+            if not self._run_with_timeout('custom_root_target_isdir', lambda: os.path.isdir(target_path), timeout_seconds=5):
+                continue
+            entry = type('CustomRootEntry', (), {
+                'name': self._custom_root_display_name(config_item, target_path),
+                'path': target_path,
+                'is_dir': lambda self=None: True,
+            })()
+            item = self._build_dir_item(req, root, entry, '', metadata_enabled, prefetch_series_paths)
+            item['name'] = entry.name
+            item['display_name'] = entry.name
+            items.append(item)
+
+        if prefetch_series_paths:
+            deduped = []
+            seen = set()
+            for series_rel in prefetch_series_paths:
+                if series_rel and series_rel not in seen:
+                    seen.add(series_rel)
+                    deduped.append(series_rel)
+            self._schedule_metadata_prefetch(req, deduped)
+
+        return {
+            'ret': 'success',
+            'data': {
+                'current_path': '',
+                'parent_path': '',
+                'is_root': True,
+                'item_count': len(items),
+                'items': items,
+            }
+        }
+
     def _gds_tool_db_path(self):
         return os.path.join(F.config['path_data'], 'db', 'gds_tool.db')
 
@@ -1531,6 +1637,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             root, _ = self._resolve_target_path('')
             return self._list_recent_items(req, root, metadata_enabled, client_id)
         root, target = self._resolve_target_path(relative_path)
+        if str(relative_path or '').strip().strip('/') == '' and self._custom_root_enabled():
+            return self._list_custom_root_items(req, root, metadata_enabled)
         if not self._run_with_timeout('list_target_isdir', lambda: os.path.isdir(target), timeout_seconds=5):
             raise Exception('target path is not a directory')
 
@@ -1649,6 +1757,69 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 'current_path': current_rel,
                 'parent_path': '' if current_rel == '' else os.path.dirname(current_rel).replace('\\', '/'),
                 'is_root': current_rel == '',
+                'item_count': len(items),
+                'items': items,
+            }
+        }
+
+    def _search_items(self, req):
+        query = (req.args.get('query') or req.form.get('query') or '').strip()
+        metadata_enabled = self._req_bool(req, 'metadata_enabled', True)
+        if query == '':
+            return {'ret': 'success', 'data': {'query': '', 'item_count': 0, 'items': []}}
+
+        self._ensure_plex_art_table()
+        term = '%{}%'.format(query.lower())
+        with self._metadata_db_connect(timeout=0.5) as conn:
+            rows = conn.execute(
+                '''
+                SELECT series_path, COALESCE(poster_url, ''), COALESCE(thumb_url, ''), updated_at
+                FROM plex_art_item
+                WHERE series_path IS NOT NULL
+                  AND TRIM(series_path) != ''
+                  AND LOWER(series_path) LIKE ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 100
+                ''',
+                (term,),
+            ).fetchall()
+
+        seen = set()
+        items = []
+        for row in rows:
+            series_path = (row[0] or '').replace('\\', '/').strip().strip('/')
+            if not series_path or series_path in seen:
+                continue
+            seen.add(series_path)
+            display_name = os.path.basename(series_path) or series_path
+            item = {
+                'name': display_name,
+                'display_name': display_name,
+                'path': series_path,
+                'is_dir': True,
+                'type': 'dir',
+                'size': 0,
+                'mime': None,
+                'extension': '',
+                'playable': False,
+            }
+            if metadata_enabled:
+                poster_url = row[1] or ''
+                thumb_url = row[2] or ''
+                if poster_url:
+                    item['poster_url'] = poster_url
+                elif series_path:
+                    item['poster_url'] = self._make_meta_art_url(req, series_path, 'poster')
+                if thumb_url:
+                    item['thumb_url'] = thumb_url
+                elif series_path:
+                    item['thumb_url'] = self._make_meta_art_url(req, series_path, 'thumb')
+            items.append(item)
+
+        return {
+            'ret': 'success',
+            'data': {
+                'query': query,
                 'item_count': len(items),
                 'items': items,
             }
@@ -1865,19 +2036,15 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return 'transcode'
 
     def _make_directplay_url(self, req, file_path):
-        base = req.url_root.rstrip('/')
-        query = self._request_auth_query(req)
-        query['path'] = file_path
-        return f'{base}/{P.package_name}/api/directplay?{urlencode(query)}'
+        return self._make_api_url(req, 'directplay', {'path': file_path})
 
     def _make_transcode_stream_url(self, req, file_path, requested_resolution, quality, start_seconds):
-        base = req.url_root.rstrip('/')
-        query = self._request_auth_query(req)
-        query['path'] = file_path
-        query['resolution'] = requested_resolution
-        query['quality'] = quality
-        query['start_seconds'] = self._format_seek_seconds(start_seconds)
-        return f'{base}/{P.package_name}/api/transcode_stream?{urlencode(query)}'
+        return self._make_api_url(req, 'transcode_stream', {
+            'path': file_path,
+            'resolution': requested_resolution,
+            'quality': quality,
+            'start_seconds': self._format_seek_seconds(start_seconds),
+        })
 
     def _directplay(self, req):
         file_path = req.args.get('path', '')
@@ -1976,8 +2143,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return job
 
     def _make_vod_url(self, req, job_id, filename):
-        base = req.url_root.rstrip('/')
-        return f'{base}/{P.package_name}/api/vod?job_id={job_id}&file={quote(filename)}'
+        return self._make_api_url(req, 'vod', {'job_id': job_id, 'file': filename})
 
     def _serve_vod(self, req):
         job_id = req.args.get('job_id', '')
@@ -2379,8 +2545,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         raise Exception('HLS playlist creation failed')
 
     def _make_hls_url(self, req, job_id, filename):
-        base = req.url_root.rstrip('/')
-        return f'{base}/{P.package_name}/api/hls?job_id={job_id}&file={quote(filename)}'
+        return self._make_api_url(req, 'hls', {'job_id': job_id, 'file': filename})
 
     def _serve_hls(self, sub, req):
         if sub == 'hls':
@@ -2402,7 +2567,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             abort(404)
         if filename.endswith('.m3u8'):
             with open(target, 'r', encoding='utf-8') as f:
-                data = self._rewrite_playlist(f.read(), job)
+                data = self._rewrite_playlist(req, f.read(), job)
             return Response(data, mimetype='application/vnd.apple.mpegurl')
         with open(target, 'rb') as f:
             data = f.read()
@@ -2431,13 +2596,20 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 except Exception:
                     pass
 
-    def _rewrite_playlist(self, content, job):
+    def _rewrite_playlist(self, req, content, job):
         lines = []
         for line in content.splitlines():
             if line and not line.startswith('#'):
-                line = f'{job["base_hls_url"]}?job_id={job["job_id"]}&file={quote(line)}'
+                line = self._make_hls_url(req, job['job_id'], line)
             lines.append(line)
         return '\n'.join(lines) + '\n'
+
+    def _make_api_url(self, req, api_name, extra_query=None):
+        base = req.url_root.rstrip('/')
+        query = self._request_auth_query(req)
+        if extra_query:
+            query.update(extra_query)
+        return f'{base}/{P.package_name}/api/{api_name}?{urlencode(query)}'
 
     def _start_hls_log_thread(self, job):
         def worker():

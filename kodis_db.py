@@ -20,6 +20,7 @@ class PlexImportMixin(object):
         'total': 0,
         'processed': 0,
         'imported': 0,
+        'skipped': 0,
         'percent': 0,
         'message': '',
         'error': '',
@@ -44,8 +45,24 @@ class PlexImportMixin(object):
     def _plex_import_log_path(self):
         return os.path.join(os.path.dirname(self._metadata_db_path()), 'plex_import_debug.log')
 
+    def _db_tool_item_log_path(self, kind='added'):
+        suffix = 'deleted' if str(kind or '').lower() == 'deleted' else 'added'
+        return os.path.join(os.path.dirname(self._metadata_db_path()), f'plex_{suffix}_items.log')
+
+    def _append_db_tool_log(self, message):
+        log_path = self._plex_import_log_path()
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with open(log_path, 'a', encoding='utf-8') as fp:
+                fp.write('[{}] {}\n'.format(timestamp, message))
+        except Exception:
+            pass
+
     def _read_plex_import_log_tail(self, max_lines=80, max_chars=12000):
         log_path = self._plex_import_log_path()
+        return self._read_text_log_tail(log_path, max_lines=max_lines, max_chars=max_chars)
+
+    def _read_text_log_tail(self, log_path, max_lines=80, max_chars=12000):
         if not os.path.exists(log_path):
             return ''
         try:
@@ -63,24 +80,149 @@ class PlexImportMixin(object):
         with self._metadata_db_connect(timeout=0.2) as conn:
             rows = conn.execute(
                 '''
-                SELECT file_path, series_path, updated_at
+                SELECT rowid, file_path, series_path, updated_at
                 FROM plex_art_item
-                ORDER BY updated_at DESC, file_path ASC
+                ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
                 ''',
                 (int(limit_count or 80),),
             ).fetchall()
         result = []
         for row in rows:
-            file_path = row[0] or ''
-            series_path = row[1] or ''
-            updated_at = int(row[2] or 0)
+            file_path = row[1] or ''
+            series_path = row[2] or ''
+            updated_at = int(row[3] or 0)
+            label = series_path or file_path
             result.append({
                 'file_path': file_path,
                 'series_path': series_path,
                 'updated_at': updated_at,
-                'label': file_path or series_path,
+                'label': label,
             })
+        return result
+
+    def _ensure_cleanup_deleted_table(self):
+        with self._metadata_db_connect() as conn:
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS plex_cleanup_deleted (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    deleted_at INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
+            conn.execute(
+                '''
+                CREATE INDEX IF NOT EXISTS idx_plex_cleanup_deleted_deleted_at
+                ON plex_cleanup_deleted(deleted_at)
+                '''
+            )
+            conn.commit()
+
+    def _get_recent_cleanup_deleted_items(self, limit_count=80):
+        self._ensure_cleanup_deleted_table()
+        with self._metadata_db_connect(timeout=0.2) as conn:
+            rows = conn.execute(
+                '''
+                SELECT path, deleted_at
+                FROM plex_cleanup_deleted
+                ORDER BY deleted_at DESC, id DESC
+                LIMIT ?
+                ''',
+                (int(limit_count or 80),),
+            ).fetchall()
+        result = []
+        for row in rows:
+            path = row[0] or ''
+            deleted_at = int(row[1] or 0)
+            result.append({
+                'path': path,
+                'deleted_at': deleted_at,
+                'label': path,
+            })
+        return result
+
+    def _get_db_tool_log_tail(self):
+        return self._read_plex_import_log_tail()
+
+    def _get_db_tool_item_log_tail(self, kind='added'):
+        return self._read_text_log_tail(self._db_tool_item_log_path(kind))
+
+    def _cleanup_scheduler_job_id(self):
+        return f'{P.package_name}_db_cleanup'
+
+    def _cleanup_schedule_expression(self):
+        value = (P.ModelSetting.get('db_cleanup_schedule') or '').strip()
+        if value == '':
+            value = (P.ModelSetting.get('db_cleanup_cron') or '').strip()
+        if value == '':
+            value = (P.ModelSetting.get('db_cleanup_interval') or '').strip()
+        return value
+
+    def _sync_cleanup_scheduler(self, enabled_override=None, schedule_override=None):
+        if enabled_override is not None:
+            enabled_text = str(enabled_override).strip().lower()
+            enabled_value = 'True' if enabled_text in ('true', '1', 'on', 'yes') else 'False'
+            P.ModelSetting.set('db_cleanup_schedule_enabled', enabled_value)
+        if schedule_override is not None:
+            P.ModelSetting.set('db_cleanup_schedule', str(schedule_override or '').strip())
+        job_id = self._cleanup_scheduler_job_id()
+        enabled = str(P.ModelSetting.get('db_cleanup_schedule_enabled') or 'False').lower() == 'true'
+        schedule = self._cleanup_schedule_expression()
+        if F.scheduler.is_include(job_id):
+            F.scheduler.remove_job(job_id)
+        if not enabled or schedule == '':
+            return {'ret': 'success', 'msg': ''}
+        job = Job(P.package_name, job_id, schedule, self._scheduled_cleanup_job, 'ff_kodis DB cleanup')
+        F.scheduler.add_job_instance(job)
+        return {'ret': 'success', 'msg': ''}
+
+    def _scheduled_cleanup_job(self):
+        result = self._start_plex_cleanup()
+        self._append_db_tool_log('scheduled_cleanup_job dispatched ret={} msg={}'.format(result.get('ret'), result.get('msg')))
+        if result.get('ret') != 'success':
+            return
+        self._wait_for_cleanup_completion()
+
+    def _wait_for_cleanup_completion(self, startup_timeout=15, poll_interval=1.0):
+        started = False
+        deadline = time.time() + max(float(startup_timeout or 15), 1.0)
+        while time.time() < deadline:
+            state = self._read_plex_import_state()
+            if state.get('running'):
+                started = True
+                break
+            if state.get('finished'):
+                self._append_db_tool_log(
+                    'scheduled_cleanup_job finished before running state message={} error={}'.format(
+                        state.get('message', ''),
+                        state.get('error', ''),
+                    )
+                )
+                return
+            time.sleep(poll_interval)
+        if not started:
+            self._append_db_tool_log('scheduled_cleanup_job wait timeout before running state')
+            return
+        while True:
+            state = self._read_plex_import_state()
+            if not state.get('running'):
+                self._append_db_tool_log(
+                    'scheduled_cleanup_job completed message={} error={}'.format(
+                        state.get('message', ''),
+                        state.get('error', ''),
+                    )
+                )
+                return
+            time.sleep(poll_interval)
+
+    def _normalize_cleanup_paths(self, cleanup_path):
+        result = []
+        for chunk in str(cleanup_path or '').replace('\r', '\n').split('\n'):
+            normalized = chunk.strip()
+            if normalized:
+                result.append(normalized)
         return result
 
     def _ensure_plex_art_table(self):
@@ -116,10 +258,12 @@ class PlexImportMixin(object):
                     total INTEGER NOT NULL DEFAULT 0,
                     processed INTEGER NOT NULL DEFAULT 0,
                     imported INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0,
                     percent INTEGER NOT NULL DEFAULT 0,
                     message TEXT NOT NULL DEFAULT '',
                     current_path TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
+                    worker_pid INTEGER NOT NULL DEFAULT 0,
                     started_at INTEGER NOT NULL DEFAULT 0,
                     ended_at INTEGER NOT NULL DEFAULT 0
                 )
@@ -128,23 +272,27 @@ class PlexImportMixin(object):
             columns = [row[1] for row in conn.execute("PRAGMA table_info(plex_import_state)").fetchall()]
             if 'current_path' not in columns:
                 conn.execute("ALTER TABLE plex_import_state ADD COLUMN current_path TEXT NOT NULL DEFAULT ''")
+            if 'worker_pid' not in columns:
+                conn.execute("ALTER TABLE plex_import_state ADD COLUMN worker_pid INTEGER NOT NULL DEFAULT 0")
+            if 'skipped' not in columns:
+                conn.execute("ALTER TABLE plex_import_state ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 '''
                 INSERT OR IGNORE INTO plex_import_state (
-                    id, running, finished, stop_requested, total, processed, imported,
-                    percent, message, current_path, error, started_at, ended_at
-                ) VALUES (1, 0, 0, 0, 0, 0, 0, 0, '', '', '', 0, 0)
+                    id, running, finished, stop_requested, total, processed, imported, skipped,
+                    percent, message, current_path, error, worker_pid, started_at, ended_at
+                ) VALUES (1, 0, 0, 0, 0, 0, 0, 0, 0, '', '', '', 0, 0, 0)
                 '''
             )
             conn.commit()
 
-    def _read_plex_import_state(self):
+    def _read_plex_import_state_raw(self):
         try:
             with self._metadata_db_connect(timeout=0.2) as conn:
                 row = conn.execute(
                     '''
-                    SELECT running, finished, stop_requested, total, processed, imported,
-                           percent, message, current_path, error, started_at, ended_at
+                    SELECT running, finished, stop_requested, total, processed, imported, skipped,
+                           percent, message, current_path, error, worker_pid, started_at, ended_at
                     FROM plex_import_state
                     WHERE id = 1
                     '''
@@ -159,10 +307,12 @@ class PlexImportMixin(object):
                 'total': 0,
                 'processed': 0,
                 'imported': 0,
+                'skipped': 0,
                 'percent': 0,
                 'message': '',
                 'current_path': '',
                 'error': '',
+                'worker_pid': 0,
                 'started_at': 0,
                 'ended_at': 0,
             }
@@ -173,24 +323,69 @@ class PlexImportMixin(object):
             'total': int(row[3] or 0),
             'processed': int(row[4] or 0),
             'imported': int(row[5] or 0),
-            'percent': int(row[6] or 0),
-            'message': row[7] or '',
-            'current_path': row[8] or '',
-            'error': row[9] or '',
-            'started_at': int(row[10] or 0),
-            'ended_at': int(row[11] or 0),
+            'skipped': int(row[6] or 0),
+            'percent': int(row[7] or 0),
+            'message': row[8] or '',
+            'current_path': row[9] or '',
+            'error': row[10] or '',
+            'worker_pid': int(row[11] or 0),
+            'started_at': int(row[12] or 0),
+            'ended_at': int(row[13] or 0),
         }
+
+    def _is_pid_alive(self, pid):
+        try:
+            pid = int(pid or 0)
+        except Exception:
+            return False
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return False
+
+    def _clear_stale_plex_import_state(self):
+        state = self._read_plex_import_state_raw()
+        if not state.get('running'):
+            return state
+        worker_pid = int(state.get('worker_pid') or 0)
+        if worker_pid > 0 and self._is_pid_alive(worker_pid):
+            return state
+        self._append_db_tool_log(
+            'stale_db_task_reset message={} current_path={} worker_pid={}'.format(
+                state.get('message') or '',
+                state.get('current_path') or '',
+                worker_pid,
+            )
+        )
+        self._write_plex_import_state(
+            running=False,
+            finished=True,
+            stop_requested=False,
+            message='Task state reset after restart',
+            error='',
+            worker_pid=0,
+            ended_at=int(time.time()),
+        )
+        return self._read_plex_import_state_raw()
+
+    def _read_plex_import_state(self):
+        return self._clear_stale_plex_import_state()
 
     def _write_plex_import_state(self, **kwargs):
         self._ensure_plex_import_state_table()
-        current = self._read_plex_import_state()
+        current = self._read_plex_import_state_raw()
         current.update(kwargs)
         with self._metadata_db_connect() as conn:
             conn.execute(
                 '''
                 UPDATE plex_import_state
                 SET running = ?, finished = ?, stop_requested = ?, total = ?, processed = ?,
-                    imported = ?, percent = ?, message = ?, current_path = ?, error = ?, started_at = ?, ended_at = ?
+                    imported = ?, skipped = ?, percent = ?, message = ?, current_path = ?, error = ?, worker_pid = ?, started_at = ?, ended_at = ?
                 WHERE id = 1
                 ''',
                 (
@@ -200,18 +395,20 @@ class PlexImportMixin(object):
                     int(current.get('total') or 0),
                     int(current.get('processed') or 0),
                     int(current.get('imported') or 0),
+                    int(current.get('skipped') or 0),
                     int(current.get('percent') or 0),
                     current.get('message') or '',
                     current.get('current_path') or '',
                     current.get('error') or '',
+                    int(current.get('worker_pid') or 0),
                     int(current.get('started_at') or 0),
                     int(current.get('ended_at') or 0),
                 ),
             )
             conn.commit()
 
-    def _plex_import_worker_path(self):
-        return os.path.join(os.path.dirname(__file__), 'plex_import_worker.py')
+    def _db_worker_path(self):
+        return os.path.join(os.path.dirname(__file__), 'kodis_db_worker.py')
 
     def _normalize_plex_file_to_rel(self, file_path):
         normalized = str(file_path or '').replace('\\', '/').strip()
@@ -260,18 +457,11 @@ class PlexImportMixin(object):
         FROM metadata_items mi
         JOIN media_items mdi ON mdi.metadata_item_id = mi.id
         JOIN media_parts mp ON mp.media_item_id = mdi.id
-        LEFT JOIN metadata_items parent ON parent.id = mi.parent_id
         WHERE mp.file IS NOT NULL
           AND TRIM(mp.file) != ''
           AND (
-            LOWER(COALESCE(mi.user_thumb_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(mi.user_thumb_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(mi.user_art_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(mi.user_art_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(parent.user_thumb_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(parent.user_thumb_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(parent.user_art_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(parent.user_art_url, '')) LIKE 'https://%%'
+            mp.file LIKE '%/VIDEO/%'
+            OR mp.file LIKE 'VIDEO/%'
           )
         '''
         with sqlite3.connect(plex_db_path) as conn:
@@ -293,14 +483,8 @@ class PlexImportMixin(object):
         WHERE mp.file IS NOT NULL
           AND TRIM(mp.file) != ''
           AND (
-            LOWER(COALESCE(mi.user_thumb_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(mi.user_thumb_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(mi.user_art_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(mi.user_art_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(parent.user_thumb_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(parent.user_thumb_url, '')) LIKE 'https://%%'
-            OR LOWER(COALESCE(parent.user_art_url, '')) LIKE 'http://%%'
-            OR LOWER(COALESCE(parent.user_art_url, '')) LIKE 'https://%%'
+            mp.file LIKE '%/VIDEO/%'
+            OR mp.file LIKE 'VIDEO/%'
           )
         ORDER BY mp.id
         '''
@@ -376,12 +560,20 @@ class PlexImportMixin(object):
     def _start_plex_import(self, plex_db_path=''):
         plex_db_path = (plex_db_path or P.ModelSetting.get('plex_db_path') or '').strip()
         if plex_db_path == '':
+            self._append_db_tool_log('start_plex_import rejected: empty plex_db_path')
             return {'ret': 'warning', 'msg': 'Plex DB path is empty'}
         if not os.path.exists(plex_db_path):
+            self._append_db_tool_log('start_plex_import rejected: path does not exist path={}'.format(plex_db_path))
             return {'ret': 'warning', 'msg': 'Plex DB path does not exist'}
         P.ModelSetting.set('plex_db_path', plex_db_path)
         state = self._read_plex_import_state()
         if state.get('running'):
+            self._append_db_tool_log(
+                'start_plex_import rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
             return {'ret': 'warning', 'msg': 'Import already running'}
         self._write_plex_import_state(
             running=True,
@@ -390,6 +582,7 @@ class PlexImportMixin(object):
             total=0,
             processed=0,
             imported=0,
+            skipped=0,
             percent=0,
             message='Preparing import...',
             current_path='',
@@ -399,46 +592,310 @@ class PlexImportMixin(object):
         )
         with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
             fp.write('[{}] Preparing import\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
-        subprocess.Popen(
+        with open(self._db_tool_item_log_path('added'), 'w', encoding='utf-8') as fp:
+            fp.write('')
+        self._append_db_tool_log('start_plex_import accepted: plex_db_path={}'.format(plex_db_path))
+        proc = subprocess.Popen(
             [
                 sys.executable,
-                self._plex_import_worker_path(),
+                self._db_worker_path(),
                 self._metadata_db_path(),
                 plex_db_path,
                 os.path.abspath(P.ModelSetting.get('gds_path') or ''),
                 self._plex_import_log_path(),
+                self._db_tool_item_log_path('added'),
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_plex_import worker spawned')
         return {'ret': 'success', 'msg': 'Plex import started'}
+
+    def _start_kodis_db_import(self, kodis_db_url=''):
+        kodis_db_url = (kodis_db_url or P.ModelSetting.get('kodis_db_url') or '').strip()
+        if kodis_db_url == '':
+            self._append_db_tool_log('start_kodis_db_import rejected: empty kodis_db_url')
+            return {'ret': 'warning', 'msg': 'Kodis DB URL is empty'}
+        P.ModelSetting.set('kodis_db_url', kodis_db_url)
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_kodis_db_import rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing DB import...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing DB import\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        self._append_db_tool_log('start_kodis_db_import accepted: source_url={}'.format(kodis_db_url))
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                '',
+                '',
+                self._plex_import_log_path(),
+                '',
+                'db_import',
+                kodis_db_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_kodis_db_import worker spawned')
+        return {'ret': 'success', 'msg': 'Kodis DB import started'}
+
+    def _start_plex_cleanup(self, cleanup_path=''):
+        gds_root = os.path.abspath(P.ModelSetting.get('gds_path') or '')
+        cleanup_path = (cleanup_path or P.ModelSetting.get('db_cleanup_path') or '').strip()
+        cleanup_paths = self._normalize_cleanup_paths(cleanup_path)
+        if gds_root == '':
+            self._append_db_tool_log('start_plex_cleanup rejected: empty gds_path')
+            return {'ret': 'warning', 'msg': 'GDS path is empty'}
+        if not os.path.isdir(gds_root):
+            self._append_db_tool_log('start_plex_cleanup rejected: invalid gds_path path={}'.format(gds_root))
+            return {'ret': 'warning', 'msg': 'GDS path does not exist'}
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_plex_cleanup rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing cleanup...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing cleanup\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        with open(self._db_tool_item_log_path('deleted'), 'w', encoding='utf-8') as fp:
+            fp.write('')
+        self._append_db_tool_log('start_plex_cleanup accepted: gds_root={} cleanup_path={}'.format(gds_root, ' | '.join(cleanup_paths) if cleanup_paths else '/'))
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                '',
+                gds_root,
+                self._plex_import_log_path(),
+                self._db_tool_item_log_path('deleted'),
+                'cleanup',
+                '\n'.join(cleanup_paths),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_plex_cleanup worker spawned')
+        return {'ret': 'success', 'msg': 'Plex cleanup started'}
+
+    def _start_db_vacuum(self):
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_db_vacuum rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing DB optimization...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing DB optimization\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        self._append_db_tool_log('start_db_vacuum accepted')
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                '',
+                '',
+                self._plex_import_log_path(),
+                '',
+                'vacuum',
+                '',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_db_vacuum worker spawned')
+        return {'ret': 'success', 'msg': 'DB optimization started'}
 
     def _stop_plex_import(self):
         state = self._read_plex_import_state()
         if not state.get('running'):
+            self._append_db_tool_log('stop_plex_import ignored: no running task')
             return {'ret': 'warning', 'msg': 'Import is not running'}
         self._write_plex_import_state(stop_requested=True, message='Stopping import...')
+        self._append_db_tool_log(
+            'stop_plex_import requested: message={} current_path={}'.format(
+                state.get('message') or '',
+                state.get('current_path') or '',
+            )
+        )
         return {'ret': 'success', 'msg': 'Stop requested'}
+
+    def _start_index_scan(self, scan_root_path=''):
+        scan_root_path = (scan_root_path or P.ModelSetting.get('index_scan_path') or '').strip()
+        exclude_text = (P.ModelSetting.get('index_scan_exclude') or '').strip()
+        if scan_root_path == '':
+            self._append_db_tool_log('start_index_scan rejected: empty scan_root_path')
+            return {'ret': 'warning', 'msg': 'Index scan path is empty'}
+        if not os.path.exists(scan_root_path):
+            self._append_db_tool_log('start_index_scan rejected: path does not exist path={}'.format(scan_root_path))
+            return {'ret': 'warning', 'msg': 'Index scan path does not exist'}
+        if not os.path.isdir(scan_root_path):
+            self._append_db_tool_log('start_index_scan rejected: not a directory path={}'.format(scan_root_path))
+            return {'ret': 'warning', 'msg': 'Index scan path is not a directory'}
+        P.ModelSetting.set('index_scan_path', scan_root_path)
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_index_scan rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing index scan...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing index scan\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        with open(self._db_tool_item_log_path('added'), 'w', encoding='utf-8') as fp:
+            fp.write('')
+        self._append_db_tool_log('start_index_scan accepted: scan_root_path={}'.format(os.path.abspath(scan_root_path)))
+        if exclude_text:
+            self._append_db_tool_log('start_index_scan exclude_rules={}'.format(exclude_text.replace('\r', ' ').replace('\n', ' | ')))
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                os.path.abspath(scan_root_path),
+                os.path.abspath(P.ModelSetting.get('gds_path') or ''),
+                self._plex_import_log_path(),
+                self._db_tool_item_log_path('added'),
+                'scan',
+                exclude_text,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_index_scan worker spawned')
+        return {'ret': 'success', 'msg': 'Index scan started'}
 
 
 class ModuleDb(PlexImportMixin, PluginModuleBase):
+    db_default = {
+        'index_scan_path': '',
+        'index_scan_exclude': '',
+        'plex_db_path': '',
+        'kodis_db_url': '',
+        'db_cleanup_path': '',
+        'db_cleanup_schedule_enabled': 'False',
+        'db_cleanup_schedule': '',
+    }
+
     def __init__(self, P):
         super(ModuleDb, self).__init__(P, name='db')
 
     def process_menu(self, page, req):
         arg = P.ModelSetting.to_dict()
         arg['package_name'] = P.package_name
+        arg['db_cleanup_schedule_active'] = str(F.scheduler.is_include(self._cleanup_scheduler_job_id()))
         return render_template(f'{P.package_name}_db.html', arg=arg)
 
     def process_command(self, command, arg1, arg2, arg3, req):
         try:
             if command == 'start_plex_import':
                 return jsonify(self._start_plex_import(arg1))
+            if command == 'start_kodis_db_import':
+                return jsonify(self._start_kodis_db_import(arg1))
+            if command == 'start_plex_cleanup':
+                return jsonify(self._start_plex_cleanup(arg1))
+            if command == 'start_db_vacuum':
+                return jsonify(self._start_db_vacuum())
+            if command == 'sync_cleanup_schedule':
+                return jsonify(self._sync_cleanup_scheduler(arg1, arg2))
+            if command == 'start_index_scan':
+                return jsonify(self._start_index_scan(arg1))
             if command == 'stop_plex_import':
                 return jsonify(self._stop_plex_import())
             if command == 'plex_import_status':
                 return jsonify({'ret': 'success', 'data': self._get_plex_import_status()})
+            if command == 'cleanup_deleted_items':
+                return jsonify({'ret': 'success', 'data': self._get_recent_cleanup_deleted_items()})
+            if command == 'db_tool_log_tail':
+                return jsonify({'ret': 'success', 'data': self._get_db_tool_log_tail()})
+            if command == 'db_tool_item_log_tail':
+                return jsonify({'ret': 'success', 'data': self._get_db_tool_item_log_tail(arg1)})
             if command == 'plex_import_recent_items':
                 return jsonify({'ret': 'success', 'data': self._get_recent_plex_import_items()})
             return jsonify({'ret': 'warning', 'msg': f'Unknown command: {command}'})
@@ -446,4 +903,13 @@ class ModuleDb(PlexImportMixin, PluginModuleBase):
             P.logger.error(f'Exception:{str(e)}')
             P.logger.error(traceback.format_exc())
             return jsonify({'ret': 'danger', 'msg': str(e)})
+
+    def plugin_load(self):
+        try:
+            self._ensure_plex_import_state_table()
+            self._clear_stale_plex_import_state()
+            self._sync_cleanup_scheduler()
+        except Exception as e:
+            P.logger.error(f'Exception:{str(e)}')
+            P.logger.error(traceback.format_exc())
  

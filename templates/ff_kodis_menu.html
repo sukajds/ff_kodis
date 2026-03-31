@@ -1,0 +1,282 @@
+{% extends "base.html" %}
+{% block content %}
+
+<script src="{{ url_for('static', filename='js/Sortable.js') }}"></script>
+
+{{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장']])}}
+{{ macros.m_row_start('5') }}
+{{ macros.m_row_end() }}
+
+<form id='setting' name='setting'>
+  {{ macros.setting_checkbox(
+    'custom_root_enabled',
+    '목록 편집',
+    value=arg['custom_root_enabled'],
+    desc=['끄면 기존 GDS 루트 목록을 그대로 사용합니다', '켜면 아래 항목들만 Kodi 메인에 노출됩니다']
+  ) }}
+
+  <div id="custom_root_items_wrap" class="collapse">
+    <input type="hidden" id="custom_root_items" name="custom_root_items" value='{{ arg["custom_root_items"]|e }}'>
+    <div class="custom-root-panel border rounded p-3">
+      <div class="form-group row mb-2 custom-root-header-row">
+        <div class="custom-root-name-col"><strong>항목이름</strong></div>
+        <div class="custom-root-path-col"><strong>경로</strong></div>
+        <div class="custom-root-action-col action-header"><strong>정렬</strong></div>
+      </div>
+      <div id="custom_root_items_container"></div>
+    </div>
+    <div class="form-text text-muted custom-root-help">
+      항목이름을 비워 두면 경로의 마지막 폴더명을 자동으로 사용합니다.
+    </div>
+  </div>
+</form>
+
+<template id="custom_root_item_template">
+  <div class="custom-root-item py-1">
+    <div class="form-group row mb-1 custom-root-row">
+      <div class="custom-root-name-col">
+        <input type="text" class="form-control custom-root-name">
+      </div>
+      <div class="custom-root-path-col">
+        <div class="input-group">
+          <input type="text" class="form-control custom-root-path">
+          <div class="input-group-append">
+            <button type="button" class="btn btn-outline-primary select-custom-root-path-btn">경로선택</button>
+          </div>
+        </div>
+      </div>
+      <div class="custom-root-action-col text-right">
+        <span class="sort-handle" title="드래그해서 순서 변경">⇅</span>
+        <button type="button" class="btn btn-sm btn-outline-primary move-up-btn">위</button>
+        <button type="button" class="btn btn-sm btn-outline-primary move-down-btn">아래</button>
+        <button type="button" class="btn btn-sm btn-outline-danger remove-item-btn">삭제</button>
+        <button type="button" class="btn btn-sm btn-outline-primary add-item-btn">추가</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style type="text/css">
+#custom_root_items_container .form-control,
+#custom_root_items_container .btn {
+  font-size: inherit;
+}
+
+#custom_root_items_container .btn {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.custom-root-header-row,
+.custom-root-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+.custom-root-name-col {
+  flex: 0 0 155px;
+  max-width: 155px;
+}
+
+.custom-root-path-col {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.custom-root-action-col {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.custom-root-header-row .custom-root-action-col.action-header {
+  width: 210px;
+  text-align: center;
+}
+
+.custom-root-path-col .input-group {
+  width: 100%;
+}
+
+#custom_root_items_container .custom-root-item {
+  cursor: default;
+}
+
+.sort-handle {
+  display: inline-block;
+  min-width: 22px;
+  margin-right: 6px;
+  text-align: center;
+  font-size: 18px;
+  line-height: 30px;
+  color: #1d6fa5;
+  cursor: move;
+  user-select: none;
+}
+
+.custom-root-item.sortable-ghost {
+  opacity: 0.45;
+}
+
+.custom-root-item.sortable-chosen {
+  background-color: #f1f7fb;
+}
+
+.custom-root-help {
+  font-size: inherit;
+}
+</style>
+
+<script type="text/javascript">
+var customRootItems = {{ arg['custom_root_items_list']|tojson }};
+var lastCustomRootPickerPath = '/mnt/gds/GDRIVE/VIDEO';
+var customRootSortable = null;
+
+function toggleCustomRootEditor() {
+  if ($('#custom_root_enabled').is(':checked')) {
+    $('#custom_root_items_wrap').collapse('show');
+  } else {
+    $('#custom_root_items_wrap').collapse('hide');
+  }
+}
+
+function syncCustomRootItems() {
+  var rows = [];
+  $('#custom_root_items_container .custom-root-item').each(function() {
+    var name = $(this).find('.custom-root-name').val().trim();
+    var path = $(this).find('.custom-root-path').val().trim();
+    if (path === '') {
+      return;
+    }
+    rows.push({name: name, path: path});
+  });
+  $('#custom_root_items').val(JSON.stringify(rows));
+}
+
+function bindCustomRow($row, item) {
+  $row.find('.custom-root-name').val(item && item.name ? item.name : '');
+  $row.find('.custom-root-path').val(item && item.path ? item.path : '');
+}
+
+function collectCustomRootItems() {
+  var rows = [];
+  $('#custom_root_items_container .custom-root-item').each(function() {
+    rows.push({
+      name: $(this).find('.custom-root-name').val().trim(),
+      path: $(this).find('.custom-root-path').val().trim()
+    });
+  });
+  return rows;
+}
+
+function renderCustomRootItems() {
+  var $container = $('#custom_root_items_container');
+  $container.empty();
+  if (!Array.isArray(customRootItems) || customRootItems.length === 0) {
+    customRootItems = [{name: '', path: ''}];
+  }
+  customRootItems.forEach(function(item) {
+    var $row = $($($('#custom_root_item_template').html()).get(0));
+    bindCustomRow($row, item);
+    $container.append($row);
+  });
+  initCustomRootSortable();
+  syncCustomRootItems();
+}
+
+function initCustomRootSortable() {
+  var container = document.getElementById('custom_root_items_container');
+  if (!container) {
+    return;
+  }
+  if (customRootSortable) {
+    customRootSortable.destroy();
+    customRootSortable = null;
+  }
+  customRootSortable = new Sortable(container, {
+    animation: 150,
+    handle: '.sort-handle',
+    draggable: '.custom-root-item',
+    ghostClass: 'sortable-ghost',
+    chosenClass: 'sortable-chosen',
+    onEnd: function() {
+      customRootItems = collectCustomRootItems();
+      syncCustomRootItems();
+    }
+  });
+}
+
+$(function(){
+  if (Array.isArray(customRootItems)) {
+    for (var i = customRootItems.length - 1; i >= 0; i--) {
+      if (customRootItems[i] && customRootItems[i].path) {
+        lastCustomRootPickerPath = customRootItems[i].path;
+        break;
+      }
+    }
+  }
+  toggleCustomRootEditor();
+  renderCustomRootItems();
+});
+
+$("body").on('change', '#custom_root_enabled', function(){
+  toggleCustomRootEditor();
+});
+
+$("body").on('input', '.custom-root-name, .custom-root-path', function(){
+  syncCustomRootItems();
+});
+
+$("body").on('click', '.add-item-btn', function(e){
+  e.preventDefault();
+  customRootItems = collectCustomRootItems();
+  customRootItems.push({name: '', path: ''});
+  renderCustomRootItems();
+});
+
+$("body").on('click', '.remove-item-btn', function(e){
+  e.preventDefault();
+  customRootItems = collectCustomRootItems();
+  var index = $(this).closest('.custom-root-item').index();
+  customRootItems.splice(index, 1);
+  renderCustomRootItems();
+});
+
+$("body").on('click', '.move-up-btn', function(e){
+  e.preventDefault();
+  customRootItems = collectCustomRootItems();
+  var index = $(this).closest('.custom-root-item').index();
+  if (index <= 0) return;
+  var temp = customRootItems[index - 1];
+  customRootItems[index - 1] = customRootItems[index];
+  customRootItems[index] = temp;
+  renderCustomRootItems();
+});
+
+$("body").on('click', '.move-down-btn', function(e){
+  e.preventDefault();
+  customRootItems = collectCustomRootItems();
+  var index = $(this).closest('.custom-root-item').index();
+  if (index < 0 || index >= customRootItems.length - 1) return;
+  var temp = customRootItems[index + 1];
+  customRootItems[index + 1] = customRootItems[index];
+  customRootItems[index] = temp;
+  renderCustomRootItems();
+});
+
+$("body").on('click', '.select-custom-root-path-btn', function(e){
+  e.preventDefault();
+  var $input = $(this).closest('.input-group').find('.custom-root-path');
+  var path = $input.val().trim();
+  if (path === '') path = lastCustomRootPickerPath || '/mnt/gds/GDRIVE/VIDEO';
+  globalSelectLocalFolder("목록 경로 선택", path, function(result){
+    $input.val(result);
+    lastCustomRootPickerPath = result || lastCustomRootPickerPath;
+    syncCustomRootItems();
+  });
+});
+</script>
+
+{% endblock %}

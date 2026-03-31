@@ -12,6 +12,10 @@ setting = {
                 'name': '설정',
             },
             {
+                'uri': 'menu',
+                'name': '목록',
+            },
+            {
                 'uri': 'db',
                 'name': 'DB툴',
             },
@@ -40,9 +44,9 @@ P = create_plugin_instance(setting)
 try:
     from .kodis_auth import ModuleAuth
     from .kodis_db import ModuleDb
+    from .kodis_menu import ModuleMenu
     from .kodis_setting import ModuleSetting
-    P.set_module_list([ModuleAuth, ModuleSetting, ModuleDb])
+    P.set_module_list([ModuleAuth, ModuleSetting, ModuleMenu, ModuleDb])
 except Exception as e:
     P.logger.error(f'Exception:{str(e)}')
     P.logger.error(traceback.format_exc())
- 
