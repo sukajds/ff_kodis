@@ -150,7 +150,8 @@ def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
     if source_path == '' and source_url == '':
         raise Exception('DB source path or URL is required')
     diagnostic_log(log_path, 'db_import:start source_path={} source_url={}'.format(source_path, source_url))
-    temp_fd, temp_path = tempfile.mkstemp(prefix='ff_kodis_db_', suffix='.sqlite')
+    metadata_dir = os.path.dirname(os.path.abspath(metadata_db_path)) or None
+    temp_fd, temp_path = tempfile.mkstemp(prefix='ff_kodis_db_', suffix='.sqlite', dir=metadata_dir)
     os.close(temp_fd)
     try:
         write_state(
