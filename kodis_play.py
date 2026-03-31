@@ -1782,10 +1782,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         subtitle_paths = self._find_subtitle_paths(target, root)
         subtitle_urls = [self._make_subtitle_url(req, p) for p in subtitle_paths]
 
-        # Native direct file serving cannot honor an initial seek position.
-        # When a resume/start offset is requested, fall back to the VOD path
-        # so playback can begin at the intended position.
-        if mode == 'directplay' and start_seconds <= 0:
+        if mode == 'directplay':
             stream_url = self._make_directplay_url(req, file_path)
             response = jsonify({
                 'ret': 'success',
