@@ -20,8 +20,8 @@ setting = {
                 'name': '메뉴얼',
                 'list': [
                     {
-                        'uri': 'README.md',
-                        'name': 'README',
+                        'uri': 'file/manual.md',
+                        'name': 'manual.md',
                     },
                 ]
             },
