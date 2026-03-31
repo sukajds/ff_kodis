@@ -77,3 +77,4 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
             'msg': 'Access password generated',
             'data': {'access_password': generated},
         }
+ 

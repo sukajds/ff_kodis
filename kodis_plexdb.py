@@ -37,3 +37,4 @@ class KodisPlexDBHandle(object):
         finally:
             if con is not None:
                 con.close()
+ 

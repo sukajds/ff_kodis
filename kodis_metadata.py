@@ -513,3 +513,4 @@ class KodisMetadataMixin(object):
         if not image_url:
             return Response(self.transparent_gif, mimetype='image/gif')
         return redirect(self._make_metadata_proxy_url(req, image_url))
+ 

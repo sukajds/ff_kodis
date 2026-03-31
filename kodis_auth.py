@@ -117,3 +117,4 @@ class ModuleAuth(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
             P.logger.error(f'Exception:{str(e)}')
             P.logger.error(traceback.format_exc())
             return jsonify({'ret': 'exception', 'msg': str(e)}), 500
+ 
