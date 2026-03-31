@@ -38,9 +38,10 @@ from plugin import *  # pylint: disable=wildcard-import,unused-wildcard-import
 
 P = create_plugin_instance(setting)
 try:
+    from .kodis_auth import ModuleAuth
     from .kodis_db import ModuleDb
     from .kodis_setting import ModuleSetting
-    P.set_module_list([ModuleSetting, ModuleDb])
+    P.set_module_list([ModuleAuth, ModuleSetting, ModuleDb])
 except Exception as e:
     P.logger.error(f'Exception:{str(e)}')
     P.logger.error(traceback.format_exc())

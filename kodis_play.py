@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 import traceback
+from queue import Queue
 from datetime import datetime
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -74,6 +75,40 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             pass
         self.series_folder_probe_lock = threading.Lock()
         self.series_folder_probe_cache = {}
+
+    def _diagnostic_log_path(self):
+        log_dir = os.path.join(F.config['path_data'], 'log')
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f'{P.package_name}_diag.log')
+
+    def _diagnostic_log(self, message):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        line = f'[{timestamp}] {message}\n'
+        try:
+            with open(self._diagnostic_log_path(), 'a', encoding='utf-8') as fp:
+                fp.write(line)
+        except Exception:
+            pass
+
+    def _run_with_timeout(self, label, func, timeout_seconds=5):
+        result_queue = Queue(maxsize=1)
+
+        def worker():
+            try:
+                result_queue.put(('ok', func()))
+            except Exception as e:
+                result_queue.put(('error', e))
+
+        thread = threading.Thread(target=worker, name=f'{P.package_name}_{label}', daemon=True)
+        thread.start()
+        thread.join(timeout_seconds)
+        if thread.is_alive():
+            self._diagnostic_log(f'timeout label={label} timeout={timeout_seconds}')
+            raise Exception(f'{label} timeout after {timeout_seconds}s')
+        status, payload = result_queue.get()
+        if status == 'error':
+            raise payload
+        return payload
 
     def _remember_base_url(self, base):
         normalized = str(base or '').strip().rstrip('/')
@@ -176,8 +211,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _start_auto_meta_worker(self):
         self._ensure_auto_meta_state_table()
-        with self.auto_meta_worker_lock:
-            if self.auto_meta_worker_started:
+        cls = type(self)
+        with cls.auto_meta_worker_lock:
+            if cls.auto_meta_worker_started:
                 return
             worker = threading.Thread(
                 target=self._auto_meta_worker_loop,
@@ -185,7 +221,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 daemon=True,
             )
             worker.start()
-            self.auto_meta_worker_started = True
+            cls.auto_meta_worker_started = True
             P.logger.info('Auto metadata worker started')
 
     def _auto_meta_worker_loop(self):
@@ -353,12 +389,34 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 P.logger.warning(f'Auto metadata item failed id={fp_item_id} path={gds_path}: {str(e)}')
 
     def _process_kodis_command(self, command, req):
+        req_path = getattr(req, 'path', '')
+        req_args = dict(req.args) if hasattr(req, 'args') else {}
+        req_form = dict(req.form) if hasattr(req, 'form') else {}
+        self._diagnostic_log(f'process_command command={command} path={req_path} args={req_args} form={req_form}')
+        P.logger.warning(
+            'kodis_play _process_kodis_command command=%s path=%s args=%s form=%s',
+            command,
+            req_path,
+            req_args,
+            req_form,
+        )
+        if command in ('list', 'list_root'):
+            self._diagnostic_log(f'process_command list dispatch command={command} gds_path={P.ModelSetting.get("gds_path")}')
+            P.logger.warning('kodis_play handling list command=%s gds_path=%s', command, P.ModelSetting.get('gds_path'))
+            return jsonify(self._list_items(req))
         if command == 'hls_status':
             return jsonify(self._hls_status(req))
+        self._diagnostic_log(f'process_command unhandled command={command}')
+        P.logger.warning('kodis_play unhandled command=%s', command)
         return None
 
     def _process_kodis_api(self, sub, req):
+        req_path = getattr(req, 'path', '')
+        req_args = dict(req.args) if hasattr(req, 'args') else {}
+        req_form = dict(req.form) if hasattr(req, 'form') else {}
+        self._diagnostic_log(f'process_api sub={sub} path={req_path} args={req_args} form={req_form}')
         if sub == 'list':
+            self._diagnostic_log(f'process_api list dispatch gds_path={P.ModelSetting.get("gds_path")}')
             return jsonify(self._list_items(req))
         if sub == 'play':
             return self._play(req)
@@ -379,142 +437,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         if sub == 'hls' or sub.startswith('hls/'):
             return self._serve_hls(sub, req)
         abort(404)
-
-    def process_menu(self, page, req):
-        arg = P.ModelSetting.to_dict()
-        arg['package_name'] = P.package_name
-        return render_template(f'{P.package_name}_{name}.html', arg=arg)
-
-    def process_command(self, command, arg1, arg2, arg3, req):
-        try:
-            if command == 'generate_password':
-                return jsonify(self._generate_password())
-            if command == 'ffmpeg_version':
-                return jsonify(self._ffmpeg_version())
-            if command == 'transcode_capabilities':
-                return jsonify(self._transcode_capabilities())
-            if command == 'test_transcode_encoder':
-                return jsonify(self._test_transcode_encoder())
-            response = self._process_kodis_command(command, req)
-            if response is not None:
-                return response
-            return jsonify({'ret': 'warning', 'msg': f'Unknown command: {command}'})
-        except Exception as e:
-            P.logger.error(f'Exception:{str(e)}')
-            P.logger.error(traceback.format_exc())
-            return jsonify({'ret': 'danger', 'msg': str(e)})
-
-    def process_api(self, sub, req):
-        try:
-            if sub == 'auth':
-                self._require_api_key(req, allow_session=False, require_password=True)
-                return jsonify(self._auth_issue_session(req))
-            return self._process_kodis_api(sub, req)
-        except Exception as e:
-            if getattr(e, 'code', None) in (401, 403, 404):
-                raise
-            P.logger.error(f'Exception:{str(e)}')
-            P.logger.error(traceback.format_exc())
-            return jsonify({'ret': 'exception', 'msg': str(e)}), 500
-
-    def _request_value(self, req, *keys):
-        for key in keys:
-            if hasattr(req, 'headers'):
-                value = req.headers.get(key)
-                if value not in (None, ''):
-                    return value
-            if hasattr(req, 'args'):
-                value = req.args.get(key)
-                if value not in (None, ''):
-                    return value
-            if hasattr(req, 'form'):
-                value = req.form.get(key)
-                if value not in (None, ''):
-                    return value
-        return ''
-
-    def _require_api_key(self, req, allow_session=True, require_password=True):
-        system_apikey = F.SystemModelSetting.get('apikey')
-        if not system_apikey:
-            abort(403)
-        request_apikey = self._request_value(req, 'X-FF-ApiKey', 'X-Api-Key', 'apikey')
-        if request_apikey != system_apikey:
-            abort(403)
-        if allow_session and self._has_valid_session(req):
-            return
-        if not require_password:
-            return
-        self._require_access_password(req)
-
-    def _require_access_password(self, req):
-        configured_password = (P.ModelSetting.get('access_password') or '').strip()
-        if configured_password == '':
-            return
-        request_password = self._request_value(req, 'X-FF-Password', 'password')
-        if request_password != configured_password:
-            abort(403)
-
-    def _req_bool(self, req, key, default=False):
-        value = None
-        if hasattr(req, 'args'):
-            value = req.args.get(key)
-        if (value is None or value == '') and hasattr(req, 'form'):
-            value = req.form.get(key)
-        if value is None or value == '':
-            return default
-        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
-
-    def _request_auth_query(self, req):
-        apikey = self._request_value(req, 'X-FF-ApiKey', 'X-Api-Key', 'apikey')
-        password = self._request_value(req, 'X-FF-Password', 'password')
-        session_token = self._request_value(req, 'X-FF-Session', 'session_token')
-        query = {'apikey': apikey}
-        if session_token:
-            query['session_token'] = session_token
-        elif password:
-            query['password'] = password
-        return query
-
-    def _generate_password(self):
-        generated = secrets.token_urlsafe(12)
-        P.ModelSetting.set('access_password', generated)
-        return {
-            'ret': 'success',
-            'msg': 'Access password generated',
-            'data': {'access_password': generated},
-        }
-
-    def _cleanup_auth_sessions(self):
-        now = time.time()
-        with self.auth_lock:
-            expired = [token for token, expires_at in self.auth_sessions.items() if expires_at <= now]
-            for token in expired:
-                self.auth_sessions.pop(token, None)
-
-    def _has_valid_session(self, req):
-        token = self._request_value(req, 'X-FF-Session', 'session_token').strip()
-        if token == '':
-            return False
-        self._cleanup_auth_sessions()
-        with self.auth_lock:
-            expires_at = self.auth_sessions.get(token)
-            if not expires_at or expires_at <= time.time():
-                self.auth_sessions.pop(token, None)
-                return False
-            self.auth_sessions[token] = time.time() + self.auth_session_ttl
-        return True
-
-    def _auth_issue_session(self, req):
-        token = secrets.token_urlsafe(24)
-        with self.auth_lock:
-            self.auth_sessions[token] = time.time() + self.auth_session_ttl
-        return {
-            'ret': 'success',
-            'data': {
-                'session_token': token,
-                'expires_in': self.auth_session_ttl,
-            }
-        }
 
     def _resume_db_path(self):
         db_dir = os.path.join(F.config['path_data'], 'db', P.package_name)
@@ -542,6 +464,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             conn.commit()
 
     def _get_resume_state(self, client_id, path_value):
+        path_value = self._normalize_resume_path(path_value)
         self._ensure_resume_table()
         with sqlite3.connect(self._resume_db_path()) as conn:
             row = conn.execute(
@@ -570,7 +493,11 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         }
 
     def _get_resume_state_map(self, client_id, path_values):
-        normalized = [str(path or '').strip() for path in path_values if str(path or '').strip()]
+        normalized = []
+        for path in path_values:
+            normalized_path = self._normalize_resume_path(path)
+            if normalized_path:
+                normalized.append(normalized_path)
         if not normalized:
             return {}
         self._ensure_resume_table()
@@ -599,6 +526,14 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             }
         return result
 
+    def _normalize_resume_path(self, path_value):
+        normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
+        if normalized.upper().startswith('VIDEO/'):
+            return normalized[6:].strip('/')
+        if normalized.upper() == 'VIDEO':
+            return ''
+        return normalized
+
     def _recent_folder_rows(self, client_id, limit_count=20):
         self._ensure_resume_table()
         with sqlite3.connect(self._resume_db_path()) as conn:
@@ -617,7 +552,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         result = []
         seen = set()
         for path_value, _updated_at in self._recent_folder_rows(client_id, limit_count * 5):
-            normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
+            normalized = self._normalize_resume_path(path_value)
             if not normalized or normalized == self.recent_virtual_path:
                 continue
             folder_path = os.path.dirname(normalized).replace('\\', '/').strip('/')
@@ -700,7 +635,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _resume_get(self, req):
         client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
-        path_value = (req.args.get('path') or req.form.get('path') or '').strip()
+        path_value = self._normalize_resume_path(req.args.get('path') or req.form.get('path') or '')
         if not path_value:
             return {'ret': 'success', 'data': {'position_seconds': 0, 'duration': 0, 'client_id': client_id, 'watched': False, 'in_progress': False, 'play_state': ''}}
         data = self._get_resume_state(client_id, path_value)
@@ -708,7 +643,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _resume_set(self, req):
         client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
-        path_value = (req.args.get('path') or req.form.get('path') or '').strip()
+        path_value = self._normalize_resume_path(req.args.get('path') or req.form.get('path') or '')
         position_seconds = self._parse_start_seconds(req.args.get('position_seconds') or req.form.get('position_seconds') or '0')
         duration = self._parse_start_seconds(req.args.get('duration') or req.form.get('duration') or '0')
         watched_percent = self._parse_start_seconds(req.args.get('watched_percent') or req.form.get('watched_percent') or '95')
@@ -1362,15 +1297,26 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return redirect(self._make_metadata_proxy_url(req, image_url))
 
     def _resolve_target_path(self, relative_path=''):
-        root = os.path.abspath(P.ModelSetting.get('gds_path'))
+        root = self._effective_gds_root()
         if not root:
             raise Exception('gds_path is empty')
-        if not os.path.exists(root):
+        if not self._run_with_timeout('gds_root_exists', lambda: os.path.exists(root), timeout_seconds=5):
             raise Exception('gds_path does not exist')
         candidate = os.path.abspath(os.path.join(root, relative_path or ''))
         if os.path.commonpath([root, candidate]) != root:
             raise Exception('invalid path')
         return root, candidate
+
+    def _effective_gds_root(self):
+        configured = os.path.abspath(P.ModelSetting.get('gds_path') or '')
+        if not configured:
+            return configured
+        if os.path.basename(os.path.normpath(configured)).upper() == 'VIDEO':
+            return configured
+        video_root = os.path.join(configured, 'VIDEO')
+        if self._run_with_timeout('gds_video_root_exists', lambda: os.path.isdir(video_root), timeout_seconds=5):
+            return os.path.abspath(video_root)
+        return configured
 
     def _gds_tool_db_path(self):
         return os.path.join(F.config['path_data'], 'db', 'gds_tool.db')
@@ -1594,11 +1540,23 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         recent_sort_mode = (req.args.get('recent_sort_mode') or 'latest').strip().lower()
         metadata_enabled = self._req_bool(req, 'metadata_enabled', True)
         client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
+        self._diagnostic_log(
+            'list_items start path={} recent_sort_mode={} metadata_enabled={} client_id={} gds_path={}'.format(
+                relative_path,
+                recent_sort_mode,
+                metadata_enabled,
+                client_id,
+                P.ModelSetting.get('gds_path'),
+            )
+        )
         if str(relative_path or '').strip().strip('/') == self.recent_virtual_path:
             root, _ = self._resolve_target_path('')
+            self._diagnostic_log(f'list_items recent virtual path root={root}')
             return self._list_recent_items(req, root, metadata_enabled, client_id)
         root, target = self._resolve_target_path(relative_path)
-        if not os.path.isdir(target):
+        self._diagnostic_log(f'list_items resolved root={root} target={target}')
+        if not self._run_with_timeout('list_target_isdir', lambda: os.path.isdir(target), timeout_seconds=5):
+            self._diagnostic_log(f'list_items target_not_dir target={target}')
             raise Exception('target path is not a directory')
 
         current_rel = os.path.relpath(target, root).replace('\\', '/')
@@ -1606,7 +1564,12 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             current_rel = ''
 
         items = []
-        entries = [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry)]
+        entries = self._run_with_timeout(
+            'list_target_scandir',
+            lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry)],
+            timeout_seconds=8,
+        )
+        self._diagnostic_log(f'list_items scandir_ok current_rel={current_rel} entry_count={len(entries)}')
         if self._is_recent_episode_sort_target(current_rel):
             file_groups = {}
             deduped_entries = []

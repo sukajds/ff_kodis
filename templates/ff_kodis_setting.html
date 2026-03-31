@@ -26,9 +26,9 @@
       {{ macros.setting_input_text_and_buttons(
         'gds_path',
         'GDS 경로',
-        [['list_root_btn', '파일 목록 확인']],
+        [['select_gds_path_btn', '경로 선택']],
         value=arg['gds_path'],
-        desc=['Kodi에 노출할 GDS 루트 경로']
+        desc=['Kodi에 노출할 GDS 루트 경로', 'plex_mate처럼 시스템 폴더 선택기를 사용합니다']
       ) }}
     {{ macros.m_tab_content_end() }}
 
@@ -60,9 +60,28 @@
   </div>
 </form>
 
-<div id="test_result"></div>
-
 <script type="text/javascript">
+function saveGdsPathSelection() {
+  var formData = getFormdata('#setting');
+  $.ajax({
+    url: '/' + package_name + '/ajax/setting_save',
+    type: 'POST',
+    cache: false,
+    data: formData,
+    dataType: 'json',
+    success: function(ret) {
+      if (ret) {
+        $.notify('<strong>완료</strong><br>GDS 경로를 저장했습니다.', {type: 'success'});
+      } else {
+        $.notify('<strong>실패</strong><br>GDS 경로 저장에 실패했습니다.', {type: 'warning'});
+      }
+    },
+    error: function(xhr) {
+      $.notify('<strong>실패</strong><br>' + (xhr.responseText || 'request failed'), {type: 'warning'});
+    }
+  });
+}
+
 $("body").on('click', '#ffmpeg_version_btn', function(e){
   e.preventDefault();
   globalSendCommand('ffmpeg_version');
@@ -93,20 +112,12 @@ $("body").on('click', '#test_transcode_encoder_btn', function(e){
   });
 });
 
-$("body").on('click', '#list_root_btn', function(e){
+$("body").on('click', '#select_gds_path_btn', function(e){
   e.preventDefault();
-  globalSendCommand('list', null, null, null, function(data){
-    if (data.ret !== 'success') {
-      $.notify('<strong>실패</strong><br>' + (data.msg || '알 수 없는 오류'), {type: 'warning'});
-      return;
-    }
-    var rows = data.data.items.map(function(item){
-      return '<tr><td>' + item.name + '</td><td>' + (item.is_dir ? 'DIR' : 'FILE') + '</td><td>' + item.path + '</td></tr>';
-    }).join('');
-    if (!rows) {
-      rows = '<tr><td colspan="3">표시할 항목이 없습니다.</td></tr>';
-    }
-    $('#test_result').html('<table class="table table-sm"><thead><tr><th>이름</th><th>유형</th><th>상대 경로</th></tr></thead><tbody>' + rows + '</tbody></table>');
+  var path = '/mnt/gds/GDRIVE/';
+  globalSelectLocalFolder("GDS 루트 폴더 선택", path, function(result){
+    $('#gds_path').val(result);
+    saveGdsPathSelection();
   });
 });
 
