@@ -927,9 +927,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _metadata_module_hints(self, series_rel):
         normalized = '/' + '/'.join([part for part in series_rel.replace('\\', '/').split('/') if part]) + '/'
-        movie_tokens = ('/VIDEO/ì˜í™”/', '/ì˜í™”/')
-        forced_ftv_tokens = ('/VIDEO/ì™¸êµ­TV/', '/ì™¸êµ­TV/', '/VIDEO/ì¼ë³¸ ì• ë‹ˆë©”ì´ì…˜/', '/ì¼ë³¸ ì• ë‹ˆë©”ì´ì…˜/')
-        foreign_tokens = ('/ì™¸êµ­/', '/ëŒ€ë§Œë“œë¼ë§ˆ/', '/ì¤‘ë“œ/', '/ë¯¸ë“œ/', '/ì˜ë“œ/', '/ì¼ë“œ/')
+        movie_tokens = ('/VIDEO/영화/', '/영화/')
+        forced_ftv_tokens = ('/VIDEO/외국TV/', '/외국TV/', '/VIDEO/일본 애니메이션/', '/일본 애니메이션/')
+        foreign_tokens = ('/외국/', '/대만드라마/', '/중드/', '/미드/', '/영드/', '/일드/')
         if any(token in normalized for token in movie_tokens):
             return ('movie', 'ktv', 'ftv')
         if any(token in normalized for token in forced_ftv_tokens):
@@ -937,7 +937,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         if any(token in normalized for token in foreign_tokens):
             return ('ftv', 'ktv')
         return ('ktv', 'ftv')
-
     def _fetch_json_url(self, url):
         req = Request(url, headers={'Accept': 'application/json', 'User-Agent': f'{P.package_name}/1.0'})
         with urlopen(req, timeout=20) as response:
@@ -984,7 +983,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     def _extract_episode_keys(self, filename):
         patterns = (
             r'(?:[sS](?P<season>[0-9]{1,2}))?[eE](?P<ep>[0-9]{1,4})',
-            r'(?P<ep>\d{1,4})[íšŒí™”]',
+            r'(?P<ep>\d{1,4})[회화]',
         )
         keys = []
         for pattern in patterns:
@@ -1020,7 +1019,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         if match and match.groupdict().get('ep') is not None:
             episode_no = str(int(match.group('ep')))
         if not episode_no:
-            match = re.search(r'(?P<ep>\d{1,4})[íšŒí™”]', filename)
+            match = re.search(r'(?P<ep>\d{1,4})[회화]', filename)
             if match:
                 episode_no = str(int(match.group('ep')))
 
@@ -1042,7 +1041,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     def _format_episode_display_name(self, filename):
         episode_no, air_date = self._extract_episode_display_parts(filename)
         if episode_no:
-            return '{}íšŒ'.format(episode_no)
+            return '{}회'.format(episode_no)
         return filename
 
     def _episode_source_rank(self, filename):
@@ -1957,7 +1956,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 'ret': 'danger',
                 'title': 'Encoder test',
                 'modal': '\n'.join(['[codec]', codec, '', '[results]', *tested]),
-                'msg': 'ì‚¬ìš© ê°€ëŠ¥í•œ ì¸ì½”ë”ë¥¼ ì°¾ì§€ ëª»í–ˆìŠµë‹ˆë‹¤',
+                'msg': '사용 가능한 인코더를 찾지 못했습니다',
             }
 
         P.ModelSetting.set(self._saved_encoder_key(codec), selected)
@@ -1969,11 +1968,11 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             'title': 'Encoder test',
             'modal': '\n'.join(['[codec]', codec, '', '[saved]', selected, '', '[results]', *tested]),
             'data': {'selected_encoder': selected, 'selected_device': selected_device},
-            'msg': 'í…ŒìŠ¤íŠ¸ ê²°ê³¼ê°€ ì €ìž¥ë˜ì—ˆìŠµë‹ˆë‹¤',
+            'msg': '테스트 결과가 저장되었습니다',
         }
 
     def _find_subtitle_paths(self, video_path, root):
-        """ê°™ì€ í´ë”ì— ìžˆëŠ” ëª¨ë“  .srt íŒŒì¼ì„ ì°¾ì•„ relative path ëª©ë¡ìœ¼ë¡œ ë°˜í™˜."""
+        """같은 폴더에 있는 모든 .srt 파일을 찾아 relative path 목록으로 반환."""
         folder = os.path.dirname(video_path)
         result = []
         try:
@@ -2219,11 +2218,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         if not job:
             abort(404)
         job['touched_at'] = time.time()
-        if filename == 'playlist.m3u8':
-            # segment_0ë§Œ ë™ê¸° ìƒì„± (Kodiê°€ playlist ì§í›„ ì¦‰ì‹œ ìš”ì²­)
+        if filename == 'playlist.m3u8':        # Generate segment_0 synchronously because Kodi requests the playlist immediately.
             start_index = int(job.get('start_index', 0) or 0)
             self._ensure_vod_segment(job, start_index)
-            # ë‚˜ë¨¸ì§€ëŠ” ë°±ê·¸ë¼ìš´ë“œ prefetch
+            # Prefetch the remaining segments in the background.
             self._prefetch_vod_segments(job, start_index + 1)
             return Response(self._build_vod_playlist(req, job), mimetype='application/vnd.apple.mpegurl')
         if not filename.startswith('segment_') or not filename.endswith('.ts'):
@@ -2240,10 +2238,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         import math
         source_duration = job['source_duration']
         total_segments = int((source_duration + self.segment_duration - 0.000001) // self.segment_duration)
-        target_duration = math.ceil(self.segment_duration)
-        # MEDIA-SEQUENCEëŠ” í•­ìƒ 0: Kodiê°€ ì „ì²´ íƒ€ìž„ë¼ì¸(0~duration)ì„ ì¸ì‹í•´ì•¼
-        # seek barê°€ ì˜¬ë°”ë¥¸ ì´ ê¸¸ì´ë¡œ í‘œì‹œë˜ê³  StartOffsetìœ¼ë¡œ ì´ì–´ë³´ê¸° ìœ„ì¹˜ì— ì •í™•ížˆ ìœ„ì¹˜í•¨.
-        # start_indexë¶€í„° ë‚˜ì—´í•˜ë©´ Kodiê°€ ì´ ì‹œê°„ì„ (duration - start_seconds)ë¡œ ê³„ì‚°í•˜ëŠ” ë²„ê·¸ ë°œìƒ.
+        target_duration = math.ceil(self.segment_duration)        # MEDIA-SEQUENCE stays at 0 so Kodi recognizes the full timeline (0~duration).
+        # This keeps the seek bar aligned with total duration while StartOffset handles resume.
+        # Starting from start_index here would make Kodi think the stream length is shorter.
         lines = [
             '#EXTM3U',
             '#EXT-X-VERSION:3',
@@ -2736,3 +2733,5 @@ for _metadata_method_name in (
 
 
  
+
+
