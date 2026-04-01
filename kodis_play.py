@@ -452,7 +452,51 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             columns = [row[1] for row in conn.execute("PRAGMA table_info(resume_item)").fetchall()]
             if 'play_state' not in columns:
                 conn.execute("ALTER TABLE resume_item ADD COLUMN play_state TEXT NOT NULL DEFAULT ''")
+            self._migrate_resume_paths(conn)
             conn.commit()
+
+    def _migrate_resume_paths(self, conn):
+        try:
+            rows = conn.execute(
+                '''
+                SELECT client_id, path, position_seconds, duration, play_state, updated_at
+                FROM resume_item
+                '''
+            ).fetchall()
+            for client_id, path_value, position_seconds, duration, play_state, updated_at in rows:
+                normalized = self._normalize_resume_path(path_value)
+                if not normalized or normalized == path_value:
+                    continue
+                conn.execute(
+                    '''
+                    INSERT INTO resume_item (client_id, path, position_seconds, duration, play_state, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(client_id, path) DO UPDATE SET
+                        position_seconds = CASE
+                            WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.position_seconds
+                            ELSE resume_item.position_seconds
+                        END,
+                        duration = CASE
+                            WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.duration
+                            ELSE resume_item.duration
+                        END,
+                        play_state = CASE
+                            WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.play_state
+                            ELSE resume_item.play_state
+                        END,
+                        updated_at = CASE
+                            WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.updated_at
+                            ELSE resume_item.updated_at
+                        END
+                    ''',
+                    (client_id, normalized, position_seconds, duration, play_state, updated_at),
+                )
+                conn.execute(
+                    'DELETE FROM resume_item WHERE client_id = ? AND path = ?',
+                    (client_id, path_value),
+                )
+        except Exception as e:
+            P.logger.warning('Resume path migration failed: %s', str(e))
 
     def _get_resume_state(self, client_id, path_value):
         path_value = self._normalize_resume_path(path_value)
@@ -519,10 +563,26 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _normalize_resume_path(self, path_value):
         normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
+        if normalized == '':
+            return ''
+        upper = normalized.upper()
+        marker = '/VIDEO/'
+        marker_index = upper.find(marker)
+        if marker_index >= 0:
+            return normalized[marker_index + len(marker):].strip('/')
+        if upper.endswith('/VIDEO'):
+            return ''
         if normalized.upper().startswith('VIDEO/'):
             return normalized[6:].strip('/')
         if normalized.upper() == 'VIDEO':
             return ''
+        gds_root = str(P.ModelSetting.get('gds_path') or '').replace('\\', '/').strip().rstrip('/')
+        if gds_root:
+            gds_root_upper = gds_root.upper()
+            if upper.startswith(gds_root_upper + '/'):
+                return normalized[len(gds_root):].strip('/')
+            if upper == gds_root_upper:
+                return ''
         return normalized
 
     def _recent_folder_rows(self, client_id, limit_count=20):
@@ -1352,6 +1412,16 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                     return '' if rel == '.' else rel.strip('/')
             except Exception:
                 return None
+
+        normalized_target = target_abs.replace('\\', '/').strip()
+        upper_target = normalized_target.upper()
+        marker = '/VIDEO/'
+        marker_index = upper_target.find(marker)
+        if marker_index >= 0:
+            tail = normalized_target[marker_index + 1:].strip('/')
+            if os.path.basename(os.path.normpath(root_abs)).upper() == 'VIDEO':
+                return tail[6:].strip('/') if tail.upper().startswith('VIDEO/') else tail
+            return tail
         return None
 
     def _custom_root_display_name(self, item, path_value):
@@ -1735,7 +1805,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         for item in items:
             if item.get('is_dir'):
                 continue
-            resume_state = resume_map.get(item.get('path', ''), {})
+            normalized_item_path = self._normalize_resume_path(item.get('path', ''))
+            resume_state = resume_map.get(normalized_item_path, {})
             item['resume_seconds'] = float(resume_state.get('position_seconds', 0.0) or 0.0)
             item['duration_seconds'] = float(resume_state.get('duration', 0.0) or 0.0)
             item['watched'] = bool(resume_state.get('watched', False))
