@@ -226,11 +226,11 @@ class KodisMetadataMixin(object):
         forced_ftv_tokens = ('/VIDEO/외국TV/', '/외국TV/', '/VIDEO/일본 애니메이션/', '/일본 애니메이션/')
         foreign_tokens = ('/외국/', '/대만드라마/', '/중드/', '/미드/', '/영드/', '/일드/')
         if any(token in normalized for token in movie_tokens):
-            return ('movie', 'ktv', 'ftv')
+            return ('movie',)
         if any(token in normalized for token in forced_ftv_tokens):
-            return ('ftv', 'ktv')
+            return ('ftv',)
         if any(token in normalized for token in foreign_tokens):
-            return ('ftv', 'ktv')
+            return ('ftv',)
         return ('ktv', 'ftv')
 
     def _fetch_json_url(self, url):
@@ -322,6 +322,23 @@ class KodisMetadataMixin(object):
                 seen.add(key)
                 deduped.append(key)
         return deduped
+
+    def _extract_season_number(self, filename, relative_path=''):
+        candidates = [str(filename or ''), str(relative_path or '')]
+        patterns = (
+            r'[sS](?P<season>[0-9]{1,2})[eE][0-9]{1,4}',
+            r'(?:Season|\uC2DC\uC98C)[\s._-]?(?P<season>[0-9]{1,2})',
+            r'[\s._/\-](?P<season>[0-9]{1,2})[\s._/\-]*(?:\uC2DC\uC98C)(?:[\s._/\-]|$)',
+        )
+        for text in candidates:
+            for pattern in patterns:
+                match = re.search(pattern, text)
+                if match and match.groupdict().get('season') is not None:
+                    try:
+                        return str(int(match.group('season')))
+                    except Exception:
+                        continue
+        return '1'
 
     def _extract_episode_thumb_map(self, payload):
         result = {}
@@ -430,6 +447,26 @@ class KodisMetadataMixin(object):
                         result[episode_key] = image_url
             except Exception:
                 continue
+        return result
+
+    def _augment_metadata_ftv_episode_thumb_map(self, base, auth_query, metadata_code, season_no, episode_map):
+        if not metadata_code:
+            return episode_map
+        result = dict(episode_map or {})
+        season_code = '{}_{}'.format(metadata_code, int(season_no or 1))
+        season_query = self._append_query_params(auth_query, {'code': season_code})
+        season_url = f"{base}/metadata/api/ftv/info?{season_query}"
+        try:
+            season_payload = self._fetch_json_url(season_url)
+            season_map = self._extract_episode_thumb_map(season_payload)
+            if season_map:
+                result.update(season_map)
+                P.logger.info(
+                    'FTV season thumb augment code=%s season=%s episode_keys=%s',
+                    metadata_code, season_no, list(season_map.keys())[:20]
+                )
+        except Exception as e:
+            P.logger.warning('FTV season thumb augment failed code=%s season=%s error=%s', metadata_code, season_no, str(e))
         return result
 
     def _lookup_metadata_cache(self, req, series_rel, force_refresh=False):
@@ -652,6 +689,30 @@ class KodisMetadataMixin(object):
                         image_url = episode_map.get(episode_key, '')
                         if image_url:
                             P.logger.info('Meta thumb matched after refresh path=%s key=%s url=%s', relative_path, episode_key, image_url)
+                            break
+            if not image_url and metadata.get('module_name') == 'ftv':
+                season_no = self._extract_season_number(os.path.basename(relative_path), relative_path)
+                episode_map = self._augment_metadata_ftv_episode_thumb_map(
+                    self._base_url_from_req(req),
+                    self._auth_query_from_req(req),
+                    metadata.get('metadata_code', ''),
+                    season_no,
+                    episode_map,
+                )
+                if episode_map:
+                    metadata['episode_json'] = json.dumps(episode_map, ensure_ascii=False)
+                    try:
+                        self._metadata_save_cached(metadata)
+                    except Exception:
+                        pass
+                    P.logger.info(
+                        'Meta thumb ftv season augment path=%s season=%s augmented_episode_keys=%s',
+                        relative_path, season_no, list(episode_map.keys())[:20]
+                    )
+                    for episode_key in episode_keys:
+                        image_url = episode_map.get(episode_key, '')
+                        if image_url:
+                            P.logger.info('Meta thumb matched after ftv season augment path=%s key=%s url=%s', relative_path, episode_key, image_url)
                             break
 
         if not image_url:

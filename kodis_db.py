@@ -42,6 +42,9 @@ class PlexImportMixin(object):
         os.makedirs(db_dir, exist_ok=True)
         return os.path.join(db_dir, 'metadata.sqlite')
 
+    def _gds_tool_db_path(self):
+        return os.path.join(F.config['path_data'], 'db', 'gds_tool.db')
+
     def _plex_import_log_path(self):
         return os.path.join(os.path.dirname(self._metadata_db_path()), 'plex_import_debug.log')
 
@@ -632,6 +635,73 @@ class PlexImportMixin(object):
         self._append_db_tool_log('start_plex_import worker spawned')
         return {'ret': 'success', 'msg': 'Plex import started'}
 
+    def _start_gds_db_import(self, import_since=''):
+        import_since = (import_since or P.ModelSetting.get('plex_import_since') or '').strip()
+        gds_db_path = self._gds_tool_db_path()
+        if not os.path.exists(gds_db_path):
+            self._append_db_tool_log('start_gds_db_import rejected: missing gds_tool.db path={}'.format(gds_db_path))
+            return {'ret': 'warning', 'msg': 'gds_tool DB path does not exist'}
+        if import_since:
+            try:
+                time.strptime(import_since, '%Y-%m-%d')
+            except Exception:
+                self._append_db_tool_log('start_gds_db_import rejected: invalid import_since={}'.format(import_since))
+                return {'ret': 'warning', 'msg': 'Import date must be YYYY-MM-DD'}
+        P.ModelSetting.set('plex_import_since', import_since)
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_gds_db_import rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing GDS import...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing GDS import\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        with open(self._db_tool_item_log_path('added'), 'w', encoding='utf-8') as fp:
+            fp.write('')
+        self._append_db_tool_log(
+            'start_gds_db_import accepted: gds_db_path={} import_since={}'.format(
+                gds_db_path,
+                import_since or '',
+            )
+        )
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                gds_db_path,
+                os.path.abspath(P.ModelSetting.get('gds_path') or ''),
+                self._plex_import_log_path(),
+                self._db_tool_item_log_path('added'),
+                'gds_import',
+                import_since,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_gds_db_import worker spawned')
+        return {'ret': 'success', 'msg': 'GDS path import started'}
+
     def _start_kodis_db_import(self, kodis_db_url=''):
         kodis_db_url = (kodis_db_url or P.ModelSetting.get('kodis_db_url') or '').strip()
         if kodis_db_url == '':
@@ -944,6 +1014,8 @@ class ModuleDb(PlexImportMixin, PluginModuleBase):
         try:
             if command == 'start_plex_import':
                 return jsonify(self._start_plex_import(arg1, arg2))
+            if command == 'start_gds_db_import':
+                return jsonify(self._start_gds_db_import(arg1))
             if command == 'start_kodis_db_import':
                 return jsonify(self._start_kodis_db_import(arg1))
             if command == 'start_plex_cleanup':

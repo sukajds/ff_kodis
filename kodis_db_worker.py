@@ -587,6 +587,21 @@ def ensure_tables(metadata_db_path):
     with db_connect(metadata_db_path) as conn:
         conn.execute(
             '''
+            CREATE TABLE IF NOT EXISTS discovered_series_item (
+                series_path TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE INDEX IF NOT EXISTS idx_discovered_series_updated_at
+            ON discovered_series_item(updated_at)
+            '''
+        )
+        conn.execute(
+            '''
             CREATE TABLE IF NOT EXISTS plex_art_item (
                 file_path TEXT PRIMARY KEY,
                 series_path TEXT,
@@ -770,6 +785,16 @@ def normalize_plex_file_to_rel(file_path):
     return ''
 
 
+def normalize_gds_file_to_rel(gds_path):
+    normalized = str(gds_path or '').replace('\\', '/').strip()
+    if normalized == '':
+        return ''
+    prefix = '/ROOT/GDRIVE/'
+    if normalized.upper().startswith(prefix.upper()):
+        normalized = normalized[len(prefix):]
+    return normalize_plex_file_to_rel(normalized)
+
+
 def extract_title_year_series_path(relative_path):
     rel = str(relative_path or '').replace('\\', '/').strip().strip('/')
     if rel == '':
@@ -816,6 +841,62 @@ def looks_like_video_filename(name):
         '.mpg', '.mpeg', '.webm', '.m4v', '.iso', '.mp2', '.mpv', '.mts',
     )
     return any(lower_name.endswith(ext) for ext in video_exts)
+
+
+def looks_like_season_folder(name):
+    text = str(name or '').strip().lower()
+    if text == '':
+        return False
+    return text.startswith('season') or '시즌' in text
+
+
+def resolve_library_item_path(relative_path, gds_root):
+    rel = str(relative_path or '').replace('\\', '/').strip().strip('/')
+    if rel == '' or gds_root == '':
+        return ''
+    root = os.path.abspath(gds_root)
+    candidates = [
+        os.path.abspath(os.path.join(root, rel.replace('/', os.sep))),
+        os.path.abspath(os.path.join(root, 'VIDEO', rel.replace('/', os.sep))),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[-1] if candidates else ''
+
+
+def normalize_series_folder_rel(relative_path):
+    rel = str(relative_path or '').replace('\\', '/').strip().strip('/')
+    if rel == '':
+        return ''
+    parts = [part for part in rel.split('/') if part]
+    if not parts:
+        return ''
+    for idx in range(len(parts) - 1, -1, -1):
+        if looks_like_title_year(parts[idx]):
+            return '/'.join(parts[:idx + 1])
+    if looks_like_season_folder(parts[-1]) and len(parts) >= 2:
+        return '/'.join(parts[:-1])
+    return rel
+
+
+def extract_gds_series_path(gds_path, gds_root):
+    rel = normalize_gds_file_to_rel(gds_path)
+    if rel == '':
+        return ''
+    target = resolve_library_item_path(rel, gds_root)
+    if target and os.path.isdir(target):
+        return normalize_series_folder_rel(rel)
+    series_rel = extract_title_year_series_path(rel)
+    if series_rel:
+        return series_rel
+    parent_rel = os.path.dirname(rel).replace('\\', '/').strip('/')
+    return normalize_series_folder_rel(parent_rel)
+
+
+def current_parent_hint(series_rel):
+    parent = os.path.dirname(str(series_rel or '').replace('\\', '/').strip('/')).replace('\\', '/').strip('/')
+    return parent or str(series_rel or '').replace('\\', '/').strip('/')
 
 
 def is_video_library_path(file_path):
@@ -1711,6 +1792,128 @@ def run_scan(metadata_db_path, scan_root_path, gds_root, log_path, item_log_path
     diagnostic_log(log_path, 'index_scan:complete processed={} imported={}'.format(processed, imported))
 
 
+def run_gds_import(metadata_db_path, gds_db_path, gds_root, log_path, item_log_path='', import_since=''):
+    import_since = str(import_since or '').strip()
+    if gds_db_path == '':
+        raise Exception('gds_tool DB path is empty')
+    if not os.path.exists(gds_db_path):
+        raise Exception('gds_tool DB path does not exist')
+    if import_since:
+        try:
+            time.strptime(import_since, '%Y-%m-%d')
+        except Exception:
+            raise Exception('Import date must be YYYY-MM-DD')
+
+    query = '''
+        SELECT id, created_time, gds_path
+        FROM fp_item
+        WHERE gds_path LIKE '/ROOT/GDRIVE/VIDEO/%'
+          AND (scan_mode IS NULL OR UPPER(scan_mode) = 'ADD')
+    '''
+    params = []
+    if import_since:
+        query += ' AND created_time >= ?'
+        params.append(import_since + ' 00:00:00')
+    query += ' ORDER BY id ASC'
+
+    diagnostic_log(log_path, 'gds_import:start gds_db_path={} import_since={}'.format(gds_db_path, import_since or ''))
+    with sqlite3.connect(gds_db_path) as gds_conn:
+        total_row = gds_conn.execute('SELECT COUNT(*) FROM ({}) AS src'.format(query), tuple(params)).fetchone()
+        total = int((total_row[0] if total_row else 0) or 0)
+        write_state(
+            metadata_db_path,
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=total,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Reading GDS DB...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with db_connect(metadata_db_path) as meta_conn:
+            processed = 0
+            imported = 0
+            skipped = 0
+            for row in gds_conn.execute(query, tuple(params)):
+                state = read_state(metadata_db_path)
+                if state.get('stop_requested'):
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        running=False,
+                        finished=True,
+                        message='GDS import stopped',
+                        worker_pid=0,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        ended_at=int(time.time()),
+                    )
+                    diagnostic_log(log_path, 'gds_import:stopped processed={} imported={} skipped={}'.format(processed, imported, skipped))
+                    return
+
+                _row_id, _created_time, gds_path = row
+                processed += 1
+                series_rel = extract_gds_series_path(gds_path, gds_root)
+                if not series_rel:
+                    skipped += 1
+                else:
+                    now_ts = int(time.time())
+                    cursor = meta_conn.execute(
+                        '''
+                        INSERT OR IGNORE INTO discovered_series_item (series_path, source, updated_at)
+                        VALUES (?, ?, ?)
+                        ''',
+                        (series_rel, 'gds_manual', now_ts),
+                    )
+                    if cursor.rowcount:
+                        imported += 1
+                        append_item_log(item_log_path, series_rel)
+                    else:
+                        skipped += 1
+
+                if processed == 1 or processed % 100 == 0 or processed == total:
+                    current_path = current_parent_hint(series_rel or normalize_gds_file_to_rel(gds_path))
+                    diagnostic_log(
+                        log_path,
+                        'gds_import:progress processed={} imported={} skipped={} current={}'.format(
+                            processed,
+                            imported,
+                            skipped,
+                            current_path,
+                        )
+                    )
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                        current_path=current_path,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Importing GDS paths...',
+                    )
+            meta_conn.commit()
+    write_state(
+        metadata_db_path,
+        running=False,
+        finished=True,
+        stop_requested=False,
+        processed=processed,
+        imported=imported,
+        skipped=skipped,
+        worker_pid=0,
+        percent=100 if total > 0 else 0,
+        message='GDS import complete',
+        ended_at=int(time.time()),
+    )
+    diagnostic_log(log_path, 'gds_import:complete processed={} imported={} skipped={}'.format(processed, imported, skipped))
+
+
 def main():
     metadata_db_path = sys.argv[1]
     source_path = sys.argv[2]
@@ -1733,6 +1936,8 @@ def main():
             run_repair_series_paths(metadata_db_path, log_path)
         elif mode == 'scan':
             run_scan(metadata_db_path, os.path.abspath(source_path), gds_root, log_path, item_log_path, extra_arg)
+        elif mode == 'gds_import':
+            run_gds_import(metadata_db_path, source_path, gds_root, log_path, item_log_path, extra_arg)
         else:
             run_import(metadata_db_path, source_path, gds_root, log_path, item_log_path, extra_arg)
     except Exception as e:

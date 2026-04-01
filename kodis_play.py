@@ -35,6 +35,17 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     auto_meta_base_url_lock = threading.Lock()
     auto_meta_base_url = ''
     auto_meta_poll_interval = 60
+    db_tree_worker_lock = threading.Lock()
+    db_tree_worker_started = False
+    db_tree_refresh_lock = threading.Lock()
+    db_tree_refresh_inflight = False
+    db_tree_poll_interval = 60
+    db_tree_json_export_lock = threading.Lock()
+    db_tree_json_refresh_interval = 1200
+    db_tree_status_log_lock = threading.Lock()
+    db_tree_last_status_key = None
+    db_tree_last_status_logged_at = 0
+    db_tree_status_log_interval = 300
     segment_duration = 2
     vod_prefetch_count = 4
     vod_initial_segments = 3
@@ -75,6 +86,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             pass
         self.series_folder_probe_lock = threading.Lock()
         self.series_folder_probe_cache = {}
+        self._start_db_tree_worker()
 
     def _diagnostic_log_path(self):
         log_dir = os.path.join(F.config['path_data'], 'log')
@@ -380,6 +392,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                     self._should_attach_series_metadata(target_rel, target)
                     or self._is_probable_series_folder(target)
                 )
+                if should_lookup:
+                    self._save_discovered_series_path(target_rel, source='auto_meta')
+                    P.logger.info('Discovered series cached id=%s path=%s', fp_item_id, target_rel)
                 if should_lookup and not self._metadata_get_cached(target_rel):
                     P.logger.info('Auto metadata lookup id=%s path=%s', fp_item_id, target_rel)
                     result = self._lookup_metadata_cache_by_base(base, target_rel)
@@ -412,6 +427,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             return jsonify(self._search_items(req))
         if sub == 'metadata_refresh':
             return jsonify(self._refresh_metadata(req))
+        if sub == 'db_tree_json':
+            return self._serve_db_tree_json(req)
         if sub == 'play':
             return self._play(req)
         if sub == 'directplay':
@@ -979,11 +996,11 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         forced_ftv_tokens = ('/VIDEO/외국TV/', '/외국TV/', '/VIDEO/일본 애니메이션/', '/일본 애니메이션/')
         foreign_tokens = ('/외국/', '/대만드라마/', '/중드/', '/미드/', '/영드/', '/일드/')
         if any(token in normalized for token in movie_tokens):
-            return ('movie', 'ktv', 'ftv')
+            return ('movie',)
         if any(token in normalized for token in forced_ftv_tokens):
-            return ('ftv', 'ktv')
+            return ('ftv',)
         if any(token in normalized for token in foreign_tokens):
-            return ('ftv', 'ktv')
+            return ('ftv',)
         return ('ktv', 'ftv')
     def _fetch_json_url(self, url):
         req = Request(url, headers={'Accept': 'application/json', 'User-Agent': f'{P.package_name}/1.0'})
@@ -1237,6 +1254,23 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                     return image_url
         return ''
 
+    def _extract_season_number(self, filename, relative_path=''):
+        candidates = [str(filename or ''), str(relative_path or '')]
+        patterns = (
+            r'[sS](?P<season>[0-9]{1,2})[eE][0-9]{1,4}',
+            r'(?:Season|\uC2DC\uC98C)[\s._-]?(?P<season>[0-9]{1,2})',
+            r'[\s._/\-](?P<season>[0-9]{1,2})[\s._/\-]*(?:\uC2DC\uC98C)(?:[\s._/\-]|$)',
+        )
+        for text in candidates:
+            for pattern in patterns:
+                match = re.search(pattern, text)
+                if match and match.groupdict().get('season') is not None:
+                    try:
+                        return str(int(match.group('season')))
+                    except Exception:
+                        continue
+        return '1'
+
     def _augment_ktv_episode_thumb_map(self, base, auth_query=None, episodes_payload=None, episode_map=None):
         if not isinstance(episodes_payload, (dict, list)):
             return episode_map
@@ -1266,6 +1300,25 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                         result[episode_key] = image_url
             except Exception:
                 continue
+        return result
+
+    def _augment_ftv_episode_thumb_map(self, base, metadata_code, season_no, episode_map):
+        if not metadata_code:
+            return episode_map
+        result = dict(episode_map or {})
+        season_code = '{}_{}'.format(metadata_code, int(season_no or 1))
+        season_url = f"{base}/metadata/api/ftv/info?{urlencode({'code': season_code})}"
+        try:
+            season_payload = self._fetch_json_url(season_url)
+            season_map = self._extract_episode_thumb_map(season_payload)
+            if season_map:
+                result.update(season_map)
+                P.logger.info(
+                    'FTV season thumb augment code=%s season=%s episode_keys=%s',
+                    metadata_code, season_no, list(season_map.keys())[:20]
+                )
+        except Exception as e:
+            P.logger.warning('FTV season thumb augment failed code=%s season=%s error=%s', metadata_code, season_no, str(e))
         return result
 
     def _lookup_metadata_cache(self, req, series_rel, force_refresh=False):
@@ -1505,6 +1558,34 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                                 image_url,
                             )
                             break
+            if not image_url and metadata.get('module_name') == 'ftv':
+                season_no = self._extract_season_number(os.path.basename(relative_path), relative_path)
+                episode_map = self._augment_ftv_episode_thumb_map(
+                    self._base_url_from_req(req),
+                    metadata.get('metadata_code', ''),
+                    season_no,
+                    episode_map,
+                )
+                if episode_map:
+                    metadata['episode_json'] = json.dumps(episode_map, ensure_ascii=False)
+                    try:
+                        self._metadata_save_cached(metadata)
+                    except Exception:
+                        pass
+                    P.logger.info(
+                        'Meta thumb ftv season augment path=%s season=%s augmented_episode_keys=%s',
+                        relative_path, season_no, list(episode_map.keys())[:20]
+                    )
+                    for episode_key in episode_keys:
+                        image_url = episode_map.get(episode_key, '')
+                        if image_url:
+                            P.logger.info(
+                                'Meta thumb matched after ftv season augment path=%s key=%s url=%s',
+                                relative_path,
+                                episode_key,
+                                image_url,
+                            )
+                            break
 
         if not image_url:
             image_url = metadata.get('poster_url') or metadata.get('thumb_url') or metadata.get('fanart_url') or ''
@@ -1635,6 +1716,596 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _gds_tool_db_path(self):
         return os.path.join(F.config['path_data'], 'db', 'gds_tool.db')
+
+    def _db_tree_json_path(self):
+        db_dir = os.path.join(F.config['path_data'], 'db', P.package_name)
+        os.makedirs(db_dir, exist_ok=True)
+        return os.path.join(db_dir, 'db_tree.json')
+
+    def _db_tree_enabled(self, req):
+        return self._req_bool(req, 'db_tree_enabled', False)
+
+    def _ensure_db_tree_tables(self):
+        with self._metadata_db_connect() as conn:
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS db_tree_item (
+                    path TEXT PRIMARY KEY,
+                    parent_path TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    is_terminal INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
+            conn.execute(
+                '''
+                CREATE INDEX IF NOT EXISTS idx_db_tree_item_parent_path
+                ON db_tree_item(parent_path, name)
+                '''
+            )
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS db_tree_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    source_max_updated_at INTEGER NOT NULL DEFAULT 0,
+                    source_row_count INTEGER NOT NULL DEFAULT 0,
+                    source_series_count INTEGER NOT NULL DEFAULT 0,
+                    source_deleted_at INTEGER NOT NULL DEFAULT 0,
+                    source_deleted_count INTEGER NOT NULL DEFAULT 0,
+                    rebuilt_at INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
+            conn.execute(
+                '''
+                INSERT OR IGNORE INTO db_tree_state (
+                    id, source_max_updated_at, source_row_count, source_series_count,
+                    source_deleted_at, source_deleted_count, rebuilt_at
+                ) VALUES (1, 0, 0, 0, 0, 0, 0)
+                '''
+            )
+            conn.commit()
+
+    def _ensure_discovered_series_table(self):
+        with self._metadata_db_connect() as conn:
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS discovered_series_item (
+                    series_path TEXT PRIMARY KEY,
+                    source TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
+            conn.execute(
+                '''
+                CREATE INDEX IF NOT EXISTS idx_discovered_series_updated_at
+                ON discovered_series_item(updated_at)
+                '''
+            )
+            conn.commit()
+
+    def _save_discovered_series_path(self, series_rel, source=''):
+        series_key = self._metadata_series_key(series_rel)
+        if not series_key:
+            return
+        self._ensure_discovered_series_table()
+        with self._metadata_db_connect(timeout=0.5) as conn:
+            conn.execute(
+                '''
+                INSERT INTO discovered_series_item (series_path, source, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(series_path) DO UPDATE SET
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                ''',
+                (series_key, str(source or ''), int(time.time())),
+            )
+            conn.commit()
+
+    def _get_db_tree_source_signature(self, conn):
+        row = conn.execute(
+            '''
+            SELECT
+                COALESCE(MAX(updated_at), 0),
+                COUNT(*),
+                COUNT(DISTINCT CASE WHEN TRIM(COALESCE(series_path, '')) != '' THEN series_path END)
+            FROM plex_art_item
+            '''
+        ).fetchone()
+        discovered_row = conn.execute(
+            '''
+            SELECT COALESCE(MAX(updated_at), 0), COUNT(*)
+            FROM discovered_series_item
+            '''
+        ).fetchone()
+        cleanup_row = conn.execute(
+            '''
+            SELECT COALESCE(MAX(deleted_at), 0), COUNT(*)
+            FROM plex_cleanup_deleted
+            '''
+        ).fetchone()
+        return {
+            'source_max_updated_at': max(
+                int((row[0] if row else 0) or 0),
+                int((discovered_row[0] if discovered_row else 0) or 0),
+            ),
+            'source_row_count': int((row[1] if row else 0) or 0) + int((discovered_row[1] if discovered_row else 0) or 0),
+            'source_series_count': int((row[2] if row else 0) or 0) + int((discovered_row[1] if discovered_row else 0) or 0),
+            'source_deleted_at': int((cleanup_row[0] if cleanup_row else 0) or 0),
+            'source_deleted_count': int((cleanup_row[1] if cleanup_row else 0) or 0),
+        }
+
+    def _get_saved_db_tree_signature(self, conn):
+        row = conn.execute(
+            '''
+            SELECT
+                source_max_updated_at, source_row_count, source_series_count,
+                source_deleted_at, source_deleted_count
+            FROM db_tree_state
+            WHERE id = 1
+            '''
+        ).fetchone()
+        return {
+            'source_max_updated_at': int((row[0] if row else 0) or 0),
+            'source_row_count': int((row[1] if row else 0) or 0),
+            'source_series_count': int((row[2] if row else 0) or 0),
+            'source_deleted_at': int((row[3] if row else 0) or 0),
+            'source_deleted_count': int((row[4] if row else 0) or 0),
+        }
+
+    def _get_db_tree_rebuilt_at(self, conn):
+        row = conn.execute(
+            '''
+            SELECT rebuilt_at
+            FROM db_tree_state
+            WHERE id = 1
+            '''
+        ).fetchone()
+        return int((row[0] if row else 0) or 0)
+
+    def _log_db_tree_status_once(self, state, current, count, rebuilt_at):
+        cls = type(self)
+        now = int(time.time())
+        status_key = (
+            state,
+            tuple(sorted((current or {}).items())),
+            int(count or 0),
+            int(rebuilt_at or 0),
+        )
+        with cls.db_tree_status_log_lock:
+            if (
+                cls.db_tree_last_status_key == status_key and
+                (now - int(cls.db_tree_last_status_logged_at or 0)) < int(cls.db_tree_status_log_interval or 300)
+            ):
+                return
+            cls.db_tree_last_status_key = status_key
+            cls.db_tree_last_status_logged_at = now
+
+        rebuilt_label = '-'
+        if rebuilt_at:
+            rebuilt_label = datetime.fromtimestamp(rebuilt_at).strftime('%Y-%m-%d %H:%M:%S')
+        if state == 'ready':
+            P.logger.info(
+                'DB tree ready cached_items=%s series=%s rebuilt_at=%s',
+                count,
+                current.get('source_series_count', 0),
+                rebuilt_label,
+            )
+        elif state == 'queued':
+            P.logger.info(
+                'DB tree refresh queued cached_items=%s series=%s inflight=%s',
+                count,
+                current.get('source_series_count', 0),
+                type(self).db_tree_refresh_inflight,
+            )
+
+    def _iter_db_tree_series_paths(self, conn):
+        seen = set()
+        queries = (
+            '''
+            SELECT DISTINCT series_path
+            FROM plex_art_item
+            WHERE TRIM(COALESCE(series_path, '')) != ''
+            ''',
+            '''
+            SELECT DISTINCT series_path
+            FROM metadata_item
+            WHERE TRIM(COALESCE(series_path, '')) != ''
+            ''',
+            '''
+            SELECT DISTINCT series_path
+            FROM discovered_series_item
+            WHERE TRIM(COALESCE(series_path, '')) != ''
+            ''',
+        )
+        for query in queries:
+            try:
+                rows = conn.execute(query).fetchall()
+            except Exception:
+                rows = []
+            for row in rows:
+                normalized = self._normalize_video_relative_path(row[0] if row else '')
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                yield normalized
+
+    def _rebuild_db_tree_cache(self, conn):
+        nodes = {}
+        now = int(time.time())
+        processed = 0
+        for series_path in self._iter_db_tree_series_paths(conn):
+            processed += 1
+            if processed == 1 or processed % 500 == 0:
+                parent_hint = os.path.dirname(series_path).replace('\\', '/').strip('/')
+                if not parent_hint:
+                    parent_hint = series_path
+                P.logger.info(
+                    'DB tree rebuild progress processed=%s parent=%s',
+                    processed,
+                    parent_hint,
+                )
+            parts = [part.strip() for part in series_path.split('/') if part.strip()]
+            if not parts:
+                continue
+            for index in range(len(parts)):
+                path_value = '/'.join(parts[:index + 1])
+                parent_path = '/'.join(parts[:index])
+                node = nodes.get(path_value)
+                if node is None:
+                    node = {
+                        'path': path_value,
+                        'parent_path': parent_path,
+                        'name': parts[index],
+                        'is_terminal': 0,
+                    }
+                    nodes[path_value] = node
+                if index == len(parts) - 1:
+                    node['is_terminal'] = 1
+
+        conn.execute('DELETE FROM db_tree_item')
+        if nodes:
+            conn.executemany(
+                '''
+                INSERT INTO db_tree_item (path, parent_path, name, is_terminal, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ''',
+                [
+                    (
+                        item['path'],
+                        item['parent_path'],
+                        item['name'],
+                        int(item['is_terminal']),
+                        now,
+                    )
+                    for item in sorted(nodes.values(), key=lambda x: x['path'])
+                ],
+            )
+        P.logger.info('DB tree rebuild nodes prepared processed=%s nodes=%s', processed, len(nodes))
+
+    def _build_db_tree_json_payload(self, conn, rebuilt_at):
+        rows = conn.execute(
+            '''
+            SELECT path, parent_path, name, is_terminal
+            FROM db_tree_item
+            ORDER BY parent_path, LOWER(name), name
+            '''
+        ).fetchall()
+        items_by_parent = {}
+        for row in rows:
+            path_value = row[0] or ''
+            parent_path = row[1] or ''
+            item = {
+                'name': row[2] or '',
+                'display_name': row[2] or '',
+                'path': path_value,
+                'is_dir': True,
+                'type': 'dir',
+                'size': 0,
+                'mime': None,
+                'extension': '',
+                'playable': False,
+                'is_terminal': bool(row[3] or 0),
+            }
+            items_by_parent.setdefault(parent_path, []).append(item)
+        return {
+            'ret': 'success',
+            'data': {
+                'version': 1,
+                'generated_at': int(time.time()),
+                'rebuilt_at': int(rebuilt_at or 0),
+                'items_by_parent': items_by_parent,
+            },
+        }
+
+    def _db_tree_json_needs_refresh(self, rebuilt_at):
+        target = self._db_tree_json_path()
+        if not os.path.exists(target):
+            return True
+        try:
+            mtime = int(os.path.getmtime(target) or 0)
+        except Exception:
+            mtime = 0
+        if int(rebuilt_at or 0) > mtime:
+            return True
+        if (int(time.time()) - mtime) >= int(self.db_tree_json_refresh_interval or 1200):
+            return True
+        return False
+
+    def _export_db_tree_json_cache(self, conn, rebuilt_at):
+        target = self._db_tree_json_path()
+        payload = self._build_db_tree_json_payload(conn, rebuilt_at)
+        tmp_path = target + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(',', ':'))
+        os.replace(tmp_path, target)
+        item_count = sum(len(items) for items in (payload.get('data', {}).get('items_by_parent', {}) or {}).values())
+        P.logger.info(
+            'DB tree json exported path=%s items=%s rebuilt_at=%s',
+            target,
+            item_count,
+            int(rebuilt_at or 0),
+        )
+
+    def _ensure_db_tree_json_cache(self, force=False):
+        self._ensure_db_tree_tables()
+        with self._metadata_db_connect(timeout=5) as conn:
+            current = self._get_db_tree_source_signature(conn)
+            saved = self._get_saved_db_tree_signature(conn)
+            rebuilt_at = self._get_db_tree_rebuilt_at(conn)
+            count_row = conn.execute('SELECT COUNT(*) FROM db_tree_item').fetchone()
+            count = int((count_row[0] if count_row else 0) or 0)
+            json_path = self._db_tree_json_path()
+            if current != saved or count <= 0:
+                self._trigger_db_tree_refresh_async()
+                return os.path.exists(json_path)
+            if (not force) and (not self._db_tree_json_needs_refresh(rebuilt_at)):
+                return True
+            with type(self).db_tree_json_export_lock:
+                if (not force) and (not self._db_tree_json_needs_refresh(rebuilt_at)):
+                    return True
+                self._export_db_tree_json_cache(conn, rebuilt_at)
+                return True
+
+    def _ensure_db_tree_cache(self):
+        self._ensure_plex_art_table()
+        self._ensure_cleanup_deleted_table()
+        self._ensure_metadata_table()
+        self._ensure_discovered_series_table()
+        self._ensure_db_tree_tables()
+        with self._metadata_db_connect(timeout=0.5) as conn:
+            current = self._get_db_tree_source_signature(conn)
+            saved = self._get_saved_db_tree_signature(conn)
+            rebuilt_at = self._get_db_tree_rebuilt_at(conn)
+            count_row = conn.execute('SELECT COUNT(*) FROM db_tree_item').fetchone()
+        count = int((count_row[0] if count_row else 0) or 0)
+        if current != saved or count <= 0:
+            self._trigger_db_tree_refresh_async()
+            self._log_db_tree_status_once('queued', current, count, rebuilt_at)
+        else:
+            self._log_db_tree_status_once('ready', current, count, rebuilt_at)
+        return count
+
+    def _refresh_db_tree_cache(self, force=False):
+        with self._metadata_db_connect(timeout=5) as conn:
+            self._ensure_plex_art_table()
+            self._ensure_cleanup_deleted_table()
+            self._ensure_metadata_table()
+            self._ensure_discovered_series_table()
+            self._ensure_db_tree_tables()
+            current = self._get_db_tree_source_signature(conn)
+            saved = self._get_saved_db_tree_signature(conn)
+            rebuilt_at = self._get_db_tree_rebuilt_at(conn)
+            count_row = conn.execute('SELECT COUNT(*) FROM db_tree_item').fetchone()
+            count = int((count_row[0] if count_row else 0) or 0)
+            if (not force) and current == saved and count > 0:
+                self._log_db_tree_status_once('ready', current, count, rebuilt_at)
+                return False
+            P.logger.info('DB tree rebuild start force=%s', force)
+            self._rebuild_db_tree_cache(conn)
+            rebuilt_at = int(time.time())
+            conn.execute(
+                '''
+                UPDATE db_tree_state
+                SET source_max_updated_at = ?, source_row_count = ?, source_series_count = ?,
+                    source_deleted_at = ?, source_deleted_count = ?, rebuilt_at = ?
+                WHERE id = 1
+                ''',
+                (
+                    current['source_max_updated_at'],
+                    current['source_row_count'],
+                    current['source_series_count'],
+                    current['source_deleted_at'],
+                    current['source_deleted_count'],
+                    rebuilt_at,
+                ),
+            )
+            conn.commit()
+        P.logger.info(
+            'DB tree rebuilt rows=%s series=%s deleted=%s',
+            current['source_row_count'],
+            current['source_series_count'],
+            current['source_deleted_count'],
+        )
+        with self._metadata_db_connect(timeout=0.5) as conn:
+            count_row = conn.execute('SELECT COUNT(*) FROM db_tree_item').fetchone()
+        count = int((count_row[0] if count_row else 0) or 0)
+        self._log_db_tree_status_once('ready', current, count, rebuilt_at)
+        return True
+
+    def _trigger_db_tree_refresh_async(self, force=False):
+        cls = type(self)
+        with cls.db_tree_refresh_lock:
+            if cls.db_tree_refresh_inflight:
+                return False
+            cls.db_tree_refresh_inflight = True
+
+        def worker():
+            try:
+                self._refresh_db_tree_cache(force=force)
+            except Exception as e:
+                P.logger.warning('DB tree refresh failed: %s', str(e))
+            finally:
+                with cls.db_tree_refresh_lock:
+                    cls.db_tree_refresh_inflight = False
+
+        thread = threading.Thread(
+            target=worker,
+            name='ff_kodis_db_tree_refresh',
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _start_db_tree_worker(self):
+        cls = type(self)
+        with cls.db_tree_worker_lock:
+            if cls.db_tree_worker_started:
+                return
+            worker = threading.Thread(
+                target=self._db_tree_worker_loop,
+                name='ff_kodis_db_tree_worker',
+                daemon=True,
+            )
+            worker.start()
+            cls.db_tree_worker_started = True
+            P.logger.info('DB tree worker started')
+
+    def _db_tree_worker_loop(self):
+        time.sleep(3)
+        while True:
+            try:
+                self._refresh_db_tree_cache(force=False)
+                self._ensure_db_tree_json_cache(force=False)
+            except Exception as e:
+                P.logger.warning('DB tree worker cycle failed: %s', str(e))
+            time.sleep(max(int(self.db_tree_poll_interval or 60), 10))
+
+    def _serve_db_tree_json(self, req):
+        self._remember_base_url_from_req(req)
+        if not self._ensure_db_tree_json_cache(force=False):
+            return jsonify({
+                'ret': 'warning',
+                'msg': 'DB tree json is not ready yet',
+                'data': {
+                    'ready': False,
+                },
+            })
+        target = self._db_tree_json_path()
+        if not os.path.exists(target):
+            abort(404)
+        return send_file(target, mimetype='application/json', conditional=True, as_attachment=False)
+
+    def _get_db_tree_node(self, relative_path):
+        normalized = self._normalize_video_relative_path(relative_path)
+        self._ensure_db_tree_tables()
+        with self._metadata_db_connect(timeout=0.2) as conn:
+            row = conn.execute(
+                '''
+                SELECT path, parent_path, name, is_terminal
+                FROM db_tree_item
+                WHERE path = ?
+                ''',
+                (normalized,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            'path': row[0] or '',
+            'parent_path': row[1] or '',
+            'name': row[2] or '',
+            'is_terminal': bool(row[3] or 0),
+        }
+
+    def _get_db_tree_children(self, relative_path):
+        normalized = self._normalize_video_relative_path(relative_path)
+        self._ensure_db_tree_tables()
+        with self._metadata_db_connect(timeout=0.2) as conn:
+            rows = conn.execute(
+                '''
+                SELECT path, parent_path, name, is_terminal
+                FROM db_tree_item
+                WHERE parent_path = ?
+                ORDER BY LOWER(name), name
+                ''',
+                (normalized,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                'path': row[0] or '',
+                'parent_path': row[1] or '',
+                'name': row[2] or '',
+                'is_terminal': bool(row[3] or 0),
+            })
+        return result
+
+    def _list_items_from_db_tree(self, req, root, current_rel, metadata_enabled):
+        if not self._db_tree_enabled(req):
+            return None
+        if self._ensure_db_tree_cache() <= 0:
+            return None
+
+        normalized_rel = self._normalize_video_relative_path(current_rel)
+        if normalized_rel:
+            node = self._get_db_tree_node(normalized_rel)
+            if node is None:
+                return None
+            if node.get('is_terminal'):
+                return None
+
+        children = self._get_db_tree_children(normalized_rel)
+        if not children:
+            return None
+
+        items = []
+        prefetch_series_paths = []
+        for child in children:
+            target_path = os.path.abspath(os.path.join(root, child['path'].replace('/', os.sep)))
+            entry = type('DbTreeEntry', (), {
+                'name': child['name'],
+                'path': target_path,
+                'is_dir': lambda self=None: True,
+            })()
+            item = self._build_dir_item(req, root, entry, normalized_rel, metadata_enabled, prefetch_series_paths)
+            item['name'] = child['name']
+            item['display_name'] = child['name']
+            items.append(item)
+
+        if normalized_rel == '':
+            items.insert(0, {
+                'name': '최근 재생항목',
+                'display_name': '최근 재생항목',
+                'path': self.recent_virtual_path,
+                'is_dir': True,
+                'type': 'dir',
+                'size': 0,
+                'mime': None,
+                'extension': '',
+                'playable': False,
+            })
+
+        if prefetch_series_paths:
+            deduped = []
+            seen = set()
+            for series_rel in prefetch_series_paths:
+                if series_rel and series_rel not in seen:
+                    seen.add(series_rel)
+                    deduped.append(series_rel)
+            self._schedule_metadata_prefetch(req, deduped)
+
+        return {
+            'ret': 'success',
+            'data': {
+                'current_path': normalized_rel,
+                'parent_path': '' if normalized_rel == '' else os.path.dirname(normalized_rel).replace('\\', '/'),
+                'is_root': normalized_rel == '',
+                'item_count': len(items),
+                'items': items,
+            }
+        }
 
     def _is_recent_sort_target(self, current_rel):
         normalized = '/'.join([part for part in (current_rel or '').split('/') if part])
@@ -1867,12 +2538,14 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         root, target = self._resolve_target_path(relative_path)
         if str(relative_path or '').strip().strip('/') == '' and self._custom_root_enabled():
             return self._list_custom_root_items(req, root, metadata_enabled)
-        if not self._run_with_timeout('list_target_isdir', lambda: os.path.isdir(target), timeout_seconds=5):
-            raise Exception('target path is not a directory')
-
         current_rel = os.path.relpath(target, root).replace('\\', '/')
         if current_rel == '.':
             current_rel = ''
+        db_tree_result = self._list_items_from_db_tree(req, root, current_rel, metadata_enabled)
+        if db_tree_result is not None:
+            return db_tree_result
+        if not self._run_with_timeout('list_target_isdir', lambda: os.path.isdir(target), timeout_seconds=5):
+            raise Exception('target path is not a directory')
 
         items = []
         entries = self._run_with_timeout(
@@ -2149,17 +2822,120 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         }
 
     def _find_subtitle_paths(self, video_path, root):
-        """같은 폴더에 있는 모든 .srt 파일을 찾아 relative path 목록으로 반환."""
+        """같은 폴더의 자막 중 현재 영상과 가장 잘 맞는 항목만 반환."""
         folder = os.path.dirname(video_path)
         result = []
         try:
+            subtitle_entries = []
             for entry in sorted(os.scandir(folder), key=lambda x: x.name.lower()):
-                if entry.is_file() and '.srt' in entry.name.lower():
-                    rel = os.path.relpath(entry.path, root).replace('\\', '/')
-                    result.append(rel)
+                if entry.is_file() and self._is_supported_subtitle_file(entry.name):
+                    subtitle_entries.append(entry)
+            if not subtitle_entries:
+                return result
+
+            scored = []
+            for entry in subtitle_entries:
+                score = self._score_subtitle_match(video_path, entry.name)
+                if score is None:
+                    continue
+                rel = os.path.relpath(entry.path, root).replace('\\', '/')
+                scored.append((score, rel, entry.name))
+            if not scored:
+                return result
+
+            scored.sort(key=lambda item: (-item[0], item[2].lower()))
+            top_score = scored[0][0]
+            minimum_score = 150 if len(subtitle_entries) > 1 else 0
+            for score, rel, _name in scored:
+                if score < minimum_score:
+                    continue
+                if score + 50 < top_score:
+                    continue
+                result.append(rel)
         except Exception:
             pass
         return result
+
+    def _is_supported_subtitle_file(self, filename):
+        lower = str(filename or '').lower()
+        return lower.endswith(('.srt', '.ass', '.ssa', '.vtt', '.sub'))
+
+    def _normalize_subtitle_name(self, filename):
+        stem = os.path.splitext(os.path.basename(str(filename or '')))[0]
+        stem = re.sub(
+            r'(?i)(?:[ ._\-\[\(])(?:ko|kor|kr|eng|en|jpn|jp|chs|cht|cn|sc|tc|korean|english|forced|default|sdh|cc)(?=$|[ ._\-\]\)])',
+            '',
+            stem,
+        )
+        stem = re.sub(r'[\[\]\(\)]', ' ', stem)
+        stem = re.sub(r'\s+', ' ', stem).strip().lower()
+        compact = re.sub(r'[^0-9a-z]+', '', stem)
+        return stem, compact
+
+    def _subtitle_language_score(self, filename):
+        lower = str(filename or '').lower()
+        bonuses = (
+            ('korean', 20),
+            ('kor', 20),
+            ('ko', 15),
+            ('한글', 20),
+            ('한국어', 20),
+            ('eng', 5),
+            ('english', 5),
+        )
+        score = 0
+        for token, value in bonuses:
+            if token in lower:
+                score = max(score, value)
+        if 'forced' in lower:
+            score -= 5
+        return score
+
+    def _score_subtitle_match(self, video_path, subtitle_name):
+        video_name = os.path.basename(str(video_path or ''))
+        video_stem, video_compact = self._normalize_subtitle_name(video_name)
+        sub_stem, sub_compact = self._normalize_subtitle_name(subtitle_name)
+        if not sub_stem:
+            return None
+
+        score = self._subtitle_language_score(subtitle_name)
+        if video_stem == sub_stem:
+            score += 1000
+        elif sub_stem.startswith(video_stem + ' ') or sub_stem.startswith(video_stem + '.') or sub_stem.startswith(video_stem + '-'):
+            score += 900
+        elif video_stem.startswith(sub_stem + ' ') or video_stem.startswith(sub_stem + '.') or video_stem.startswith(sub_stem + '-'):
+            score += 850
+        elif video_compact and sub_compact and video_compact == sub_compact:
+            score += 950
+        elif video_compact and sub_compact and sub_compact.startswith(video_compact):
+            score += 820
+        elif video_compact and sub_compact and video_compact.startswith(sub_compact):
+            score += 780
+
+        video_keys = self._extract_episode_keys(video_name)
+        sub_keys = self._extract_episode_keys(subtitle_name)
+        if video_keys and sub_keys:
+            if set(video_keys) & set(sub_keys):
+                score += 500
+            else:
+                return None
+        elif video_keys and not sub_keys and (score < 700):
+            return None
+
+        video_dedupe = self._episode_dedupe_key(video_name)
+        sub_dedupe = self._episode_dedupe_key(subtitle_name)
+        if video_dedupe == sub_dedupe:
+            score += 300
+
+        video_tokens = [token for token in re.split(r'[^0-9a-z]+', video_compact) if token]
+        sub_tokens = [token for token in re.split(r'[^0-9a-z]+', sub_compact) if token]
+        if video_tokens and sub_tokens:
+            overlap = len(set(video_tokens) & set(sub_tokens))
+            score += overlap * 10
+
+        if score <= 0:
+            return None
+        return score
 
     def _make_subtitle_url(self, req, relative_path):
         base = req.url_root.rstrip('/')
@@ -2172,7 +2948,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         _, target = self._resolve_target_path(file_path)
         if not os.path.isfile(target):
             abort(404)
-        if not target.lower().endswith('.srt') and '.srt' not in target.lower():
+        if not self._is_supported_subtitle_file(target):
             abort(403)
         return send_file(target, mimetype='text/plain; charset=utf-8', conditional=True, as_attachment=False)
 
