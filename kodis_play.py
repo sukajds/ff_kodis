@@ -666,10 +666,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             prefetch_series_paths.append(item['path'])
         return item
 
-    def _list_recent_items(self, req, root, metadata_enabled, client_id):
+    def _list_recent_items(self, req, root, metadata_enabled, client_id, recent_limit=20):
         items = []
         prefetch_series_paths = []
-        for folder_rel in self._recent_folder_paths(client_id, 20):
+        for folder_rel in self._recent_folder_paths(client_id, recent_limit):
             target_path = self._resolve_recent_folder_target(root, folder_rel)
             if not os.path.isdir(target_path):
                 continue
@@ -1696,10 +1696,16 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         relative_path = req.args.get('path', '') if hasattr(req, 'args') else ''
         recent_sort_mode = (req.args.get('recent_sort_mode') or 'latest').strip().lower()
         metadata_enabled = self._req_bool(req, 'metadata_enabled', True)
+        recent_limit = req.args.get('recent_limit') or req.form.get('recent_limit') or '20'
+        try:
+            recent_limit = int(str(recent_limit).strip())
+        except Exception:
+            recent_limit = 20
+        recent_limit = max(1, min(recent_limit, 200))
         client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
         if str(relative_path or '').strip().strip('/') == self.recent_virtual_path:
             root, _ = self._resolve_target_path('')
-            return self._list_recent_items(req, root, metadata_enabled, client_id)
+            return self._list_recent_items(req, root, metadata_enabled, client_id, recent_limit)
         root, target = self._resolve_target_path(relative_path)
         if str(relative_path or '').strip().strip('/') == '' and self._custom_root_enabled():
             return self._list_custom_root_items(req, root, metadata_enabled)
@@ -1838,12 +1844,17 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         with self._metadata_db_connect(timeout=0.5) as conn:
             rows = conn.execute(
                 '''
-                SELECT series_path, COALESCE(poster_url, ''), COALESCE(thumb_url, ''), updated_at
+                SELECT
+                    series_path,
+                    COALESCE(MAX(CASE WHEN file_path = series_path THEN poster_url END), MAX(poster_url), ''),
+                    COALESCE(MAX(CASE WHEN file_path = series_path THEN thumb_url END), MAX(thumb_url), ''),
+                    MAX(updated_at)
                 FROM plex_art_item
                 WHERE series_path IS NOT NULL
                   AND TRIM(series_path) != ''
                   AND LOWER(series_path) LIKE ?
-                ORDER BY updated_at DESC, rowid DESC
+                GROUP BY series_path
+                ORDER BY MAX(updated_at) DESC
                 LIMIT 100
                 ''',
                 (term,),

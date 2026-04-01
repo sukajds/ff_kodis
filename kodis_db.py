@@ -353,7 +353,9 @@ class PlexImportMixin(object):
         if not state.get('running'):
             return state
         worker_pid = int(state.get('worker_pid') or 0)
-        if worker_pid > 0 and self._is_pid_alive(worker_pid):
+        if worker_pid <= 0:
+            return state
+        if self._is_pid_alive(worker_pid):
             return state
         self._append_db_tool_log(
             'stale_db_task_reset message={} current_path={} worker_pid={}'.format(

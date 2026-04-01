@@ -16,6 +16,11 @@ class KodisAuthMixin(object):
     auth_lock = threading.Lock()
     auth_session_ttl = 60 * 60 * 12
 
+    def _session_credential_key(self):
+        system_apikey = F.SystemModelSetting.get('apikey') or ''
+        configured_password = (P.ModelSetting.get('access_password') or '').strip()
+        return '{}|{}'.format(system_apikey, configured_password)
+
     def _request_value(self, req, *keys):
         for key in keys:
             if hasattr(req, 'headers'):
@@ -70,7 +75,14 @@ class KodisAuthMixin(object):
     def _cleanup_auth_sessions(self):
         now = time.time()
         with self.auth_lock:
-            expired = [token for token, expires_at in self.auth_sessions.items() if expires_at <= now]
+            expired = []
+            for token, stored in self.auth_sessions.items():
+                if isinstance(stored, dict):
+                    expires_at = float(stored.get('expires_at') or 0)
+                else:
+                    expires_at = float(stored or 0)
+                if expires_at <= now:
+                    expired.append(token)
             for token in expired:
                 self.auth_sessions.pop(token, None)
 
@@ -79,18 +91,35 @@ class KodisAuthMixin(object):
         if token == '':
             return False
         self._cleanup_auth_sessions()
+        current_key = self._session_credential_key()
         with self.auth_lock:
-            expires_at = self.auth_sessions.get(token)
+            stored = self.auth_sessions.get(token)
+            if isinstance(stored, dict):
+                expires_at = float(stored.get('expires_at') or 0)
+                credential_key = str(stored.get('credential_key') or '')
+            else:
+                expires_at = float(stored or 0)
+                credential_key = ''
             if not expires_at or expires_at <= time.time():
                 self.auth_sessions.pop(token, None)
                 return False
-            self.auth_sessions[token] = time.time() + self.auth_session_ttl
+            if credential_key != current_key:
+                self.auth_sessions.pop(token, None)
+                return False
+            self.auth_sessions[token] = {
+                'expires_at': time.time() + self.auth_session_ttl,
+                'credential_key': current_key,
+            }
         return True
 
     def _auth_issue_session(self, req):
         token = secrets.token_urlsafe(24)
+        credential_key = self._session_credential_key()
         with self.auth_lock:
-            self.auth_sessions[token] = time.time() + self.auth_session_ttl
+            self.auth_sessions[token] = {
+                'expires_at': time.time() + self.auth_session_ttl,
+                'credential_key': credential_key,
+            }
         return {
             'ret': 'success',
             'data': {

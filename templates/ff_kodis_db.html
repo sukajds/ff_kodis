@@ -44,7 +44,7 @@
       {{ macros.setting_input_text_and_buttons(
         'plex_db_path',
         'Plex DB 파일 경로',
-        [['start_plex_import_btn', '가져오기'], ['stop_plex_import_btn', '중단하기']],
+        [['select_plex_db_path_btn', '파일 선택'], ['start_plex_import_btn', '가져오기'], ['stop_plex_import_btn', '중단하기']],
         value=arg.get('plex_db_path', ''),
         desc=[
           '예: /host/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db',
@@ -230,6 +230,15 @@ $("body").on('click', '#start_plex_import_btn', function(e){
     }
     $.notify('<strong>시작</strong><br>' + (data.msg || 'Plex 메타 가져오기를 시작했습니다.'), {type: 'success'});
     fetchPlexImportStatus();
+  });
+});
+
+$("body").on('click', '#select_plex_db_path_btn', function(e){
+  e.preventDefault();
+  var path = $('#plex_db_path').val().trim();
+  if (path === '') path = '/mnt';
+  globalSelectLocalFile("Plex DB 파일 선택", path, function(result){
+    $('#plex_db_path').val(result);
   });
 });
 

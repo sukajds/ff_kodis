@@ -133,10 +133,24 @@ class KodisMetadataMixin(object):
         query['kind'] = kind
         return f'{base}/{P.package_name}/api/meta_art?{urlencode(query)}'
 
+    def _auth_query_from_req(self, req):
+        try:
+            return dict(self._request_auth_query(req) or {})
+        except Exception:
+            return {}
+
+    def _append_query_params(self, query, extra=None):
+        result = dict(query or {})
+        if extra:
+            result.update(extra)
+        return urlencode(result)
+
     def _make_metadata_proxy_url(self, req, image_url):
         base = req.url_root.rstrip('/')
         normalized_url = self._normalize_art_value(image_url)
-        return f'{base}/metadata/normal/image_proxy?url={quote(normalized_url)}'
+        query = self._auth_query_from_req(req)
+        query['url'] = normalized_url
+        return f'{base}/metadata/normal/image_proxy?{self._append_query_params(query)}'
 
     def _base_url_from_req(self, req):
         return req.url_root.rstrip('/')
@@ -323,9 +337,16 @@ class KodisMetadataMixin(object):
             return cached
 
         base = self._base_url_from_req(req)
-        return self._lookup_metadata_cache_by_base(base, series_rel, force_refresh=force_refresh, cached=cached)
+        auth_query = self._auth_query_from_req(req)
+        return self._lookup_metadata_cache_by_base(
+            base,
+            series_rel,
+            auth_query=auth_query,
+            force_refresh=force_refresh,
+            cached=cached,
+        )
 
-    def _lookup_metadata_cache_by_base(self, base, series_rel, force_refresh=False, cached=None):
+    def _lookup_metadata_cache_by_base(self, base, series_rel, auth_query=None, force_refresh=False, cached=None):
         if cached is None:
             cached = self._metadata_get_cached(series_rel)
         if cached and not force_refresh:
@@ -361,7 +382,7 @@ class KodisMetadataMixin(object):
                 for query in build_search_queries(module_name):
                     if metadata_code:
                         break
-                    search_url = f"{base}/metadata/api/{module_name}/search?{urlencode(query)}"
+                    search_url = f"{base}/metadata/api/{module_name}/search?{self._append_query_params(auth_query, query)}"
                     search_payload = self._fetch_json_url(search_url)
                     metadata_code, matched_title = self._metadata_search_code(module_name, search_payload)
                     P.logger.info(
@@ -376,7 +397,7 @@ class KodisMetadataMixin(object):
                 info_query = {'code': metadata_code}
                 if matched_title:
                     info_query['title'] = matched_title
-                info_url = f"{base}/metadata/api/{module_name}/info?{urlencode(info_query)}"
+                info_url = f"{base}/metadata/api/{module_name}/info?{self._append_query_params(auth_query, info_query)}"
                 info_payload = self._fetch_json_url(info_url)
                 P.logger.info(
                     'Metadata info module=%s series=%s code=%s payload_type=%s',
@@ -393,7 +414,7 @@ class KodisMetadataMixin(object):
                     episode_json = json.dumps(self._extract_episode_thumb_map(episodes_payload), ensure_ascii=False)
                 elif module_name == 'ktv' and len(metadata_code) > 1 and metadata_code[1] == 'D':
                     try:
-                        episode_url = f"{base}/metadata/api/ktv/episode_info?{urlencode({'code': metadata_code})}"
+                        episode_url = f"{base}/metadata/api/ktv/episode_info?{self._append_query_params(auth_query, {'code': metadata_code})}"
                         episode_payload = self._fetch_json_url(episode_url)
                         episode_json = json.dumps(self._extract_episode_thumb_map(episode_payload), ensure_ascii=False)
                     except Exception:
@@ -419,6 +440,7 @@ class KodisMetadataMixin(object):
 
     def _schedule_metadata_prefetch(self, req, series_paths):
         base = self._base_url_from_req(req)
+        auth_query = self._auth_query_from_req(req)
         for series_rel in series_paths[:6]:
             cached = self._metadata_get_cached(series_rel)
             if cached:
@@ -429,18 +451,18 @@ class KodisMetadataMixin(object):
                 self.metadata_lookup_inflight.add(series_rel)
             worker = threading.Thread(
                 target=self._metadata_prefetch_worker,
-                args=(base, series_rel),
+                args=(base, auth_query, series_rel),
                 daemon=True,
             )
             worker.start()
 
-    def _metadata_prefetch_worker(self, base, series_rel):
+    def _metadata_prefetch_worker(self, base, auth_query, series_rel):
         try:
             with self.metadata_lookup_semaphore:
                 _, target = self._resolve_target_path(series_rel)
                 if not os.path.isdir(target) or not self._is_probable_series_folder(target):
                     return
-                self._lookup_metadata_cache_by_base(base, series_rel)
+                self._lookup_metadata_cache_by_base(base, series_rel, auth_query=auth_query)
         except Exception as e:
             P.logger.warning(f'Metadata prefetch failed for {series_rel}: {str(e)}')
         finally:

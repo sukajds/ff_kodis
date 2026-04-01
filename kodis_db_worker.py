@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import sys
+import tarfile
 import tempfile
 import time
 import traceback
@@ -56,6 +57,18 @@ def looks_like_sqlite_file(file_path):
         return header == b'SQLite format 3\x00'
     except Exception:
         return False
+
+
+def looks_like_archive_file(file_path):
+    lower_path = str(file_path or '').strip().lower()
+    return lower_path.endswith('.tgz') or lower_path.endswith('.tar.gz')
+
+
+def is_av_relative_path(relative_path):
+    rel = str(relative_path or '').replace('\\', '/').strip().strip('/')
+    if rel == '':
+        return False
+    return rel.upper() == 'AV' or rel.upper().startswith('AV/')
 
 
 def normalize_shared_db_url(source_url):
@@ -144,6 +157,83 @@ def download_db_to_temp(source_url, temp_path, metadata_db_path, log_path):
     return True
 
 
+def extract_db_from_archive(archive_path, temp_path, metadata_db_path, log_path):
+    diagnostic_log(log_path, 'db_import:extract_archive archive_path={}'.format(archive_path))
+    candidates = []
+    with tarfile.open(archive_path, 'r:*') as tar:
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            lower_name = str(member.name or '').lower()
+            if lower_name.endswith('.db') or lower_name.endswith('.sqlite') or lower_name.endswith('.sqlite3'):
+                priority = 0
+                if 'com.plexapp.plugins.library' in lower_name:
+                    priority += 100
+                if lower_name.endswith('.db'):
+                    priority += 10
+                candidates.append((priority, member))
+        if not candidates:
+            raise Exception('No SQLite DB file found in archive')
+        candidates.sort(key=lambda item: (-item[0], len(item[1].name or '')))
+        member = candidates[0][1]
+        diagnostic_log(log_path, 'db_import:extract_member name={}'.format(member.name))
+        extracted = tar.extractfile(member)
+        if extracted is None:
+            raise Exception('Failed to extract DB file from archive')
+        total_size = int(member.size or 0)
+        copied = 0
+        with extracted, open(temp_path, 'wb') as dst:
+            while True:
+                state = read_state(metadata_db_path)
+                if state.get('stop_requested'):
+                    diagnostic_log(log_path, 'db_import:stopped during archive extract')
+                    write_stopped_state(metadata_db_path, 'DB import stopped')
+                    return False
+                chunk = extracted.read(1024 * 512)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                write_state(
+                    metadata_db_path,
+                    total=total_size,
+                    processed=copied,
+                    imported=0,
+                    percent=int(copied * 100 / total_size) if total_size > 0 else 0,
+                    message='Extracting DB from archive...',
+                    current_path=os.path.basename(member.name or archive_path),
+                )
+    return True
+
+
+def prepare_plex_db_source(plex_db_path, metadata_db_path, log_path):
+    source_path = str(plex_db_path or '').strip()
+    if source_path == '':
+        raise Exception('Plex DB path is empty')
+    if not looks_like_archive_file(source_path):
+        return source_path, None
+    metadata_dir = os.path.dirname(os.path.abspath(metadata_db_path)) or None
+    temp_fd, temp_path = tempfile.mkstemp(prefix='ff_kodis_plex_source_', suffix='.sqlite', dir=metadata_dir)
+    os.close(temp_fd)
+    ok = extract_db_from_archive(source_path, temp_path, metadata_db_path, log_path)
+    if not ok:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return None, None
+    if not looks_like_sqlite_file(temp_path):
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise Exception('Extracted file is not a valid SQLite database')
+    diagnostic_log(log_path, 'plex_import:using_extracted_db path={}'.format(temp_path))
+    return temp_path, temp_path
+
+
 def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
     source_path = str(source_path or '').strip()
     source_url = str(source_url or '').strip()
@@ -153,6 +243,8 @@ def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
     metadata_dir = os.path.dirname(os.path.abspath(metadata_db_path)) or None
     temp_fd, temp_path = tempfile.mkstemp(prefix='ff_kodis_db_', suffix='.sqlite', dir=metadata_dir)
     os.close(temp_fd)
+    source_temp_fd, source_temp_path = tempfile.mkstemp(prefix='ff_kodis_source_', suffix='.tmp', dir=metadata_dir)
+    os.close(source_temp_fd)
     try:
         write_state(
             metadata_db_path,
@@ -169,12 +261,19 @@ def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
             started_at=int(time.time()),
             ended_at=0,
         )
+        is_archive_source = looks_like_archive_file(source_url or source_path)
         if source_url != '':
-            ok = download_db_to_temp(source_url, temp_path, metadata_db_path, log_path)
+            target_download_path = source_temp_path if is_archive_source else temp_path
+            ok = download_db_to_temp(source_url, target_download_path, metadata_db_path, log_path)
         else:
-            ok = copy_local_db_to_temp(source_path, temp_path, metadata_db_path, log_path)
+            target_copy_path = source_temp_path if is_archive_source else temp_path
+            ok = copy_local_db_to_temp(source_path, target_copy_path, metadata_db_path, log_path)
         if not ok:
             return
+        if is_archive_source:
+            ok = extract_db_from_archive(source_temp_path, temp_path, metadata_db_path, log_path)
+            if not ok:
+                return
         if not looks_like_sqlite_file(temp_path):
             raise Exception('Downloaded file is not a valid SQLite database')
         diagnostic_log(log_path, 'db_import:replace metadata_db_path={}'.format(metadata_db_path))
@@ -200,6 +299,11 @@ def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
+            except Exception:
+                pass
+        if os.path.exists(source_temp_path):
+            try:
+                os.remove(source_temp_path)
             except Exception:
                 pass
 
@@ -408,9 +512,11 @@ def normalize_plex_file_to_rel(file_path):
     marker = '/VIDEO/'
     idx = normalized.find(marker)
     if idx >= 0:
-        return normalized[idx + len(marker):].strip('/')
+        rel = normalized[idx + len(marker):].strip('/')
+        return '' if is_av_relative_path(rel) else rel
     if normalized.startswith('VIDEO/'):
-        return normalized[6:].strip('/')
+        rel = normalized[6:].strip('/')
+        return '' if is_av_relative_path(rel) else rel
     return ''
 
 
@@ -430,7 +536,10 @@ def extract_title_year_series_path(relative_path):
 
 def is_video_library_path(file_path):
     normalized = str(file_path or '').replace('\\', '/').strip().lower()
-    return '/video/' in normalized or normalized.startswith('video/')
+    if not ('/video/' in normalized or normalized.startswith('video/')):
+        return False
+    rel = normalize_plex_file_to_rel(file_path)
+    return rel != ''
 
 
 def plex_import_scope_path(relative_path):
@@ -454,17 +563,7 @@ def is_valid_import_scope(relative_path, gds_root):
     scope = plex_import_scope_path(relative_path)
     if scope == '':
         return False
-    if gds_root == '':
-        return False
-    root = os.path.abspath(gds_root)
-    candidates = [
-        os.path.join(root, scope.replace('/', os.sep)),
-        os.path.join(root, 'VIDEO', scope.replace('/', os.sep)),
-    ]
-    for candidate in candidates:
-        if os.path.isdir(candidate):
-            return True
-    return False
+    return True
 
 
 def resolve_library_dir(relative_path, gds_root, log_path=''):
@@ -529,7 +628,6 @@ def count_rows(plex_db_path, log_path=''):
 def fetch_metadata_map(conn, metadata_ids, log_path=''):
     if not metadata_ids:
         return {}
-    diagnostic_log(log_path, 'fetch_metadata_map:start ids={}'.format(len(metadata_ids)))
     placeholders = ','.join(['?'] * len(metadata_ids))
     query = f'''
     SELECT id, parent_id, COALESCE(user_thumb_url, '') AS user_thumb_url, COALESCE(user_art_url, '') AS user_art_url
@@ -537,7 +635,6 @@ def fetch_metadata_map(conn, metadata_ids, log_path=''):
     WHERE id IN ({placeholders})
     '''
     rows = KodisPlexDBHandle.select_arg(query, tuple(metadata_ids), conn)
-    diagnostic_log(log_path, 'fetch_metadata_map:done rows={}'.format(len(rows or [])))
     result = {}
     for row in rows:
         result[int(row['id'])] = {
@@ -551,7 +648,6 @@ def fetch_metadata_map(conn, metadata_ids, log_path=''):
 def fetch_media_item_map(plex_db_path, media_item_ids, log_path=''):
     if not media_item_ids:
         return {}
-    diagnostic_log(log_path, 'fetch_media_item_map:start ids={}'.format(len(media_item_ids)))
     placeholders = ','.join(['?'] * len(media_item_ids))
     query = f'''
     SELECT id, metadata_item_id
@@ -559,7 +655,6 @@ def fetch_media_item_map(plex_db_path, media_item_ids, log_path=''):
     WHERE id IN ({placeholders})
     '''
     rows = KodisPlexDBHandle.select_arg(query, tuple(media_item_ids), plex_db_path)
-    diagnostic_log(log_path, 'fetch_media_item_map:done rows={}'.format(len(rows or [])))
     result = {}
     for row in rows:
         result[int(row['id'])] = int(row['metadata_item_id'] or 0)
@@ -578,14 +673,13 @@ def iter_rows(plex_db_path, log_path=''):
     ORDER BY mp.id
     LIMIT ?
     '''
-    batch_size = 1000
+    batch_size = 3000
     last_id = 0
     while True:
-        diagnostic_log(log_path, 'iter_rows:batch_query:start last_id={} batch_size={}'.format(last_id, batch_size))
         rows = KodisPlexDBHandle.select_arg(part_query, (last_id, batch_size), plex_db_path)
-        diagnostic_log(log_path, 'iter_rows:batch_query:done row_count={}'.format(len(rows or [])))
         if not rows:
             break
+        diagnostic_log(log_path, 'iter_rows:batch rows={} last_id={}'.format(len(rows or []), last_id))
         media_item_ids = sorted({int(row['media_item_id'] or 0) for row in rows if row.get('media_item_id') is not None})
         media_item_map = fetch_media_item_map(plex_db_path, media_item_ids, log_path)
         metadata_ids = sorted({metadata_id for metadata_id in media_item_map.values() if metadata_id})
@@ -781,6 +875,9 @@ def collect_scan_candidates(scan_root_path, gds_root, metadata_db_path='', log_p
         for dirname in dirnames:
             fullpath = os.path.join(current_root, dirname)
             rel = normalize_dir_to_rel(fullpath, gds_root)
+            if is_av_relative_path(rel):
+                diagnostic_log(log_path, 'index_scan:excluded builtin=AV path={}'.format(fullpath))
+                continue
             excluded_by = should_exclude_path(fullpath, rel, dirname, exclude_rules)
             if excluded_by:
                 diagnostic_log(log_path, 'index_scan:excluded rule={} path={}'.format(excluded_by, fullpath))
@@ -806,6 +903,36 @@ def exists_series_entry(conn, rel):
         (rel, rel),
     ).fetchone()
     return row is not None
+
+
+def exists_file_entry(conn, rel):
+    row = conn.execute(
+        '''
+        SELECT 1
+        FROM plex_art_item
+        WHERE file_path = ?
+        LIMIT 1
+        ''',
+        (rel,),
+    ).fetchone()
+    return row is not None
+
+
+def load_existing_paths(conn):
+    existing_file_paths = set()
+    existing_series_paths = set()
+    rows = conn.execute(
+        '''
+        SELECT file_path, series_path
+        FROM plex_art_item
+        '''
+    ).fetchall()
+    for file_path, series_path in rows:
+        if file_path:
+            existing_file_paths.add(file_path)
+        if series_path:
+            existing_series_paths.add(series_path)
+    return existing_file_paths, existing_series_paths
 
 
 def resolve_cleanup_scope_targets(cleanup_path, gds_root):
@@ -950,163 +1077,234 @@ def run_cleanup(metadata_db_path, gds_root, log_path, item_log_path='', cleanup_
 
 def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path=''):
     diagnostic_log(log_path, 'worker:start metadata_db_path={} plex_db_path={} gds_root={}'.format(metadata_db_path, plex_db_path, gds_root))
-    total = count_rows(plex_db_path, log_path)
-    diagnostic_log(log_path, 'worker:count_rows total={}'.format(total))
-    write_state(metadata_db_path, total=total, message='Scanning Plex DB...', percent=0)
-    write_state(metadata_db_path, message='Opening Plex row cursor...', current_path='', percent=0)
-    imported = 0
-    skipped = 0
-    processed = 0
-    now_ts = int(time.time())
-    batch_marker = 0
-    seen_series_paths = set()
-    cleaned_series_paths = set()
-    last_series_path = ''
-    with db_connect(metadata_db_path) as meta_conn:
-        for row in iter_rows(plex_db_path, log_path):
-            current_part_id = int(row['part_id'] or 0)
-            if current_part_id - batch_marker >= 1000:
-                batch_marker = current_part_id
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    message='Streaming Plex rows... last_part_id={}'.format(current_part_id),
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                )
-            if processed == 0:
-                write_state(metadata_db_path, conn=meta_conn, message='Streaming Plex rows...', percent=0)
-            state = read_state(metadata_db_path)
-            if state.get('stop_requested'):
-                meta_conn.commit()
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    running=False,
-                    finished=True,
-                    message='Import stopped',
-                    worker_pid=0,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    ended_at=int(time.time()),
-                )
-                return
-            processed += 1
-            rel = normalize_plex_file_to_rel(row['file_path'] or '')
-            if not rel or not is_valid_import_scope(rel, gds_root):
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    message='Filtering items...',
-                )
-                continue
-            series_path = extract_title_year_series_path(rel)
-            if not series_path:
-                diagnostic_log(log_path, 'worker:skip_non_title_year rel={}'.format(rel))
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    message='Filtering items...',
-                )
-                continue
-            if series_path not in cleaned_series_paths:
+    prepared_db_path = None
+    actual_plex_db_path = plex_db_path
+    try:
+        actual_plex_db_path, prepared_db_path = prepare_plex_db_source(plex_db_path, metadata_db_path, log_path)
+        if not actual_plex_db_path:
+            return
+        total = count_rows(actual_plex_db_path, log_path)
+        diagnostic_log(log_path, 'worker:count_rows total={}'.format(total))
+        write_state(metadata_db_path, total=total, message='Scanning Plex DB...', percent=0)
+        write_state(metadata_db_path, message='Opening Plex row cursor...', current_path='', percent=0)
+        imported = 0
+        skipped = 0
+        processed = 0
+        filtered_scope = 0
+        filtered_title_year = 0
+        folder_only = 0
+        imported_series = 0
+        skipped_series = 0
+        imported_episode = 0
+        skipped_episode = 0
+        now_ts = int(time.time())
+        batch_marker = 0
+        seen_series_paths = set()
+        cleaned_series_paths = set()
+        pruned_series_paths = set()
+        last_series_path = ''
+        with db_connect(metadata_db_path) as meta_conn:
+            existing_file_paths, existing_series_paths = load_existing_paths(meta_conn)
+            state_check_interval = 1000
+            progress_commit_interval = 1000
+            for row in iter_rows(actual_plex_db_path, log_path):
+                current_part_id = int(row['part_id'] or 0)
+                if current_part_id - batch_marker >= 1000:
+                    batch_marker = current_part_id
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        message='Streaming Plex rows... last_part_id={}'.format(current_part_id),
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                    )
+                if processed == 0:
+                    write_state(metadata_db_path, conn=meta_conn, message='Streaming Plex rows...', percent=0)
+                if processed > 0 and processed % state_check_interval == 0:
+                    state = read_state(metadata_db_path)
+                else:
+                    state = {}
+                if state.get('stop_requested'):
+                    meta_conn.commit()
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        running=False,
+                        finished=True,
+                        message='Import stopped',
+                        worker_pid=0,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        ended_at=int(time.time()),
+                    )
+                    return
+                processed += 1
+                rel = normalize_plex_file_to_rel(row['file_path'] or '')
+                if not rel or not is_valid_import_scope(rel, gds_root):
+                    filtered_scope += 1
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Filtering items...',
+                    )
+                    continue
+                series_path = extract_title_year_series_path(rel)
+                if not series_path:
+                    filtered_title_year += 1
+                    diagnostic_log(log_path, 'worker:skip_non_title_year rel={}'.format(rel))
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Filtering items...',
+                    )
+                    continue
+                if series_path not in cleaned_series_paths:
+                    descendant_file_paths = {
+                        path for path in existing_file_paths
+                        if path != series_path and path.startswith(series_path + '/')
+                    }
+                    descendant_series_paths = {
+                        path for path in existing_series_paths
+                        if path != series_path and path.startswith(series_path + '/')
+                    }
+                    if descendant_file_paths or descendant_series_paths:
+                        meta_conn.execute(
+                            '''
+                            DELETE FROM plex_art_item
+                            WHERE (series_path LIKE ? OR file_path LIKE ?)
+                              AND series_path != ?
+                            ''',
+                            (series_path + '/%', series_path + '/%', series_path),
+                        )
+                        existing_file_paths.difference_update(descendant_file_paths)
+                        existing_series_paths.difference_update(descendant_series_paths)
+                        pruned_series_paths.add(series_path)
+                    cleaned_series_paths.add(series_path)
+                item_thumb = row['item_thumb_url'] or ''
+                item_art = row['item_art_url'] or ''
+                parent_thumb = row['parent_thumb_url'] or ''
+                parent_art = row['parent_art_url'] or ''
+                episode_thumb_url = item_thumb if is_http_url(item_thumb) else ''
+                episode_poster_url = item_art if is_http_url(item_art) else ''
+                poster_url = ''
+                folder_thumb_url = ''
+                for candidate in (parent_thumb, parent_art, item_art, item_thumb):
+                    if is_http_url(candidate):
+                        folder_thumb_url = candidate
+                        break
+                for candidate in (item_art, parent_art, parent_thumb, item_thumb):
+                    if is_http_url(candidate):
+                        poster_url = candidate
+                        break
+                last_series_path = series_path
+                if series_path not in seen_series_paths:
+                    seen_series_paths.add(series_path)
+                    if series_path in existing_file_paths:
+                        skipped += 1
+                        skipped_series += 1
+                    else:
+                        meta_conn.execute(
+                            '''
+                            INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ''',
+                            (series_path, series_path, poster_url, folder_thumb_url or poster_url, now_ts),
+                        )
+                        imported += 1
+                        imported_series += 1
+                        existing_file_paths.add(series_path)
+                        existing_series_paths.add(series_path)
+                        append_item_log(item_log_path, series_path)
+
+                if not episode_thumb_url and not episode_poster_url:
+                    folder_only += 1
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                        current_path=series_path,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Importing folder metadata...',
+                    )
+                    continue
+
+                if rel in existing_file_paths:
+                    skipped += 1
+                    skipped_episode += 1
+                    continue
+
                 meta_conn.execute(
                     '''
-                    DELETE FROM plex_art_item
-                    WHERE (series_path LIKE ? OR file_path LIKE ?)
-                      AND series_path != ?
+                    INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
                     ''',
-                    (series_path + '/%', series_path + '/%', series_path),
+                    (rel, series_path, episode_poster_url, episode_thumb_url or episode_poster_url, now_ts),
                 )
-                cleaned_series_paths.add(series_path)
-                diagnostic_log(log_path, 'worker:pruned_descendants series_path={}'.format(series_path))
-            item_thumb = row['item_thumb_url'] or ''
-            item_art = row['item_art_url'] or ''
-            parent_thumb = row['parent_thumb_url'] or ''
-            parent_art = row['parent_art_url'] or ''
-            thumb_url = item_thumb if is_http_url(item_thumb) else ''
-            poster_url = ''
-            for candidate in (item_art, parent_art, parent_thumb, item_thumb):
-                if is_http_url(candidate):
-                    poster_url = candidate
-                    break
-            if series_path in seen_series_paths:
-                skipped += 1
-                last_series_path = series_path
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                    current_path=series_path,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    message='Filtering duplicate episode rows...',
-                )
-                continue
-            if exists_series_entry(meta_conn, series_path):
-                skipped += 1
-                seen_series_paths.add(series_path)
-                last_series_path = series_path
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                    current_path=series_path,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    message='Skipping existing folders...',
-                )
-                continue
-            seen_series_paths.add(series_path)
-            last_series_path = series_path
-            meta_conn.execute(
-                '''
-                INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ''',
-                (series_path, series_path, poster_url, thumb_url, now_ts),
+                imported += 1
+                imported_episode += 1
+                existing_file_paths.add(rel)
+                append_item_log(item_log_path, rel)
+                if processed % progress_commit_interval == 0:
+                    diagnostic_log(log_path, 'worker:commit processed={} imported={} skipped={}'.format(processed, imported, skipped))
+                    meta_conn.commit()
+                    write_state(
+                        metadata_db_path,
+                        conn=meta_conn,
+                        processed=processed,
+                        imported=imported,
+                        skipped=skipped,
+                        current_path=last_series_path,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Importing Plex metadata...',
+                    )
+            meta_conn.commit()
+        diagnostic_log(
+            log_path,
+            'worker:complete processed={} imported={} skipped={} filtered_scope={} filtered_title_year={} folder_only={} imported_series={} skipped_series={} imported_episode={} skipped_episode={}'.format(
+                processed,
+                imported,
+                skipped,
+                filtered_scope,
+                filtered_title_year,
+                folder_only,
+                imported_series,
+                skipped_series,
+                imported_episode,
+                skipped_episode,
             )
-            imported += 1
-            append_item_log(item_log_path, series_path)
-            if processed % 500 == 0:
-                diagnostic_log(log_path, 'worker:commit processed={} imported={} skipped={}'.format(processed, imported, skipped))
-                meta_conn.commit()
-                write_state(
-                    metadata_db_path,
-                    conn=meta_conn,
-                    processed=processed,
-                    imported=imported,
-                    skipped=skipped,
-                    current_path=last_series_path,
-                    percent=int(processed * 100 / total) if total > 0 else 0,
-                    message='Importing Plex metadata...',
-                )
-        meta_conn.commit()
-    diagnostic_log(log_path, 'worker:complete processed={} imported={} skipped={}'.format(processed, imported, skipped))
-    write_state(
-        metadata_db_path,
-        running=False,
-        finished=True,
-        stop_requested=False,
-        processed=processed,
-        imported=imported,
-        skipped=skipped,
-        worker_pid=0,
-        percent=100 if total > 0 else 0,
-        message='Import complete',
-        ended_at=int(time.time()),
-    )
+        )
+        if pruned_series_paths:
+            diagnostic_log(log_path, 'worker:pruned_descendants count={}'.format(len(pruned_series_paths)))
+        write_state(
+            metadata_db_path,
+            running=False,
+            finished=True,
+            stop_requested=False,
+            processed=processed,
+            imported=imported,
+            skipped=skipped,
+            worker_pid=0,
+            percent=100 if total > 0 else 0,
+            message='Import complete',
+            ended_at=int(time.time()),
+        )
+    finally:
+        if prepared_db_path and os.path.exists(prepared_db_path):
+            try:
+                os.remove(prepared_db_path)
+            except Exception:
+                pass
 
 
 def run_scan(metadata_db_path, scan_root_path, gds_root, log_path, item_log_path='', exclude_text=''):
