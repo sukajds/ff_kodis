@@ -17,6 +17,7 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
         'access_password': '',
         'show_av': 'False',
         'plex_db_path': '',
+        'plex_import_since': '',
         'transcode_codec': 'h264',
         'transcode_h264_encoder': '',
         'transcode_h265_encoder': '',

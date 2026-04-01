@@ -555,19 +555,29 @@ class PlexImportMixin(object):
             poster_url,
             thumb_url,
         )
+        # Existing plex_art_item rows were stored with poster/thumb semantics
+        # opposite to Kodi's use here, so map them on read.
         if kind == 'thumb':
-            return thumb_url or poster_url
-        return poster_url or thumb_url
+            return poster_url or thumb_url
+        return thumb_url or poster_url
 
-    def _start_plex_import(self, plex_db_path=''):
+    def _start_plex_import(self, plex_db_path='', import_since=''):
         plex_db_path = (plex_db_path or P.ModelSetting.get('plex_db_path') or '').strip()
+        import_since = (import_since or P.ModelSetting.get('plex_import_since') or '').strip()
         if plex_db_path == '':
             self._append_db_tool_log('start_plex_import rejected: empty plex_db_path')
             return {'ret': 'warning', 'msg': 'Plex DB path is empty'}
         if not os.path.exists(plex_db_path):
             self._append_db_tool_log('start_plex_import rejected: path does not exist path={}'.format(plex_db_path))
             return {'ret': 'warning', 'msg': 'Plex DB path does not exist'}
+        if import_since:
+            try:
+                time.strptime(import_since, '%Y-%m-%d')
+            except Exception:
+                self._append_db_tool_log('start_plex_import rejected: invalid import_since={}'.format(import_since))
+                return {'ret': 'warning', 'msg': 'Import date must be YYYY-MM-DD'}
         P.ModelSetting.set('plex_db_path', plex_db_path)
+        P.ModelSetting.set('plex_import_since', import_since)
         state = self._read_plex_import_state()
         if state.get('running'):
             self._append_db_tool_log(
@@ -596,7 +606,12 @@ class PlexImportMixin(object):
             fp.write('[{}] Preparing import\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
         with open(self._db_tool_item_log_path('added'), 'w', encoding='utf-8') as fp:
             fp.write('')
-        self._append_db_tool_log('start_plex_import accepted: plex_db_path={}'.format(plex_db_path))
+        self._append_db_tool_log(
+            'start_plex_import accepted: plex_db_path={} import_since={}'.format(
+                plex_db_path,
+                import_since or '',
+            )
+        )
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -606,6 +621,8 @@ class PlexImportMixin(object):
                 os.path.abspath(P.ModelSetting.get('gds_path') or ''),
                 self._plex_import_log_path(),
                 self._db_tool_item_log_path('added'),
+                'import',
+                import_since,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -775,6 +792,54 @@ class PlexImportMixin(object):
         self._append_db_tool_log('start_db_vacuum worker spawned')
         return {'ret': 'success', 'msg': 'DB optimization started'}
 
+    def _start_db_repair(self):
+        state = self._read_plex_import_state()
+        if state.get('running'):
+            self._append_db_tool_log(
+                'start_db_repair rejected: task already running message={} current_path={}'.format(
+                    state.get('message') or '',
+                    state.get('current_path') or '',
+                )
+            )
+            return {'ret': 'warning', 'msg': 'Another DB task is already running'}
+        self._write_plex_import_state(
+            running=True,
+            finished=False,
+            stop_requested=False,
+            total=0,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Preparing DB repair...',
+            current_path='',
+            error='',
+            started_at=int(time.time()),
+            ended_at=0,
+        )
+        with open(self._plex_import_log_path(), 'w', encoding='utf-8') as fp:
+            fp.write('[{}] Preparing DB repair\n'.format(time.strftime('%Y-%m-%d %H:%M:%S')))
+        self._append_db_tool_log('start_db_repair accepted')
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                self._db_worker_path(),
+                self._metadata_db_path(),
+                '',
+                '',
+                self._plex_import_log_path(),
+                '',
+                'repair',
+                '',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        self._write_plex_import_state(worker_pid=proc.pid)
+        self._append_db_tool_log('start_db_repair worker spawned')
+        return {'ret': 'success', 'msg': 'DB repair started'}
+
     def _stop_plex_import(self):
         state = self._read_plex_import_state()
         if not state.get('running'):
@@ -859,6 +924,7 @@ class ModuleDb(PlexImportMixin, PluginModuleBase):
         'index_scan_path': '',
         'index_scan_exclude': '',
         'plex_db_path': '',
+        'plex_import_since': '',
         'kodis_db_url': '',
         'db_cleanup_path': '',
         'db_cleanup_schedule_enabled': 'False',
@@ -877,13 +943,15 @@ class ModuleDb(PlexImportMixin, PluginModuleBase):
     def process_command(self, command, arg1, arg2, arg3, req):
         try:
             if command == 'start_plex_import':
-                return jsonify(self._start_plex_import(arg1))
+                return jsonify(self._start_plex_import(arg1, arg2))
             if command == 'start_kodis_db_import':
                 return jsonify(self._start_kodis_db_import(arg1))
             if command == 'start_plex_cleanup':
                 return jsonify(self._start_plex_cleanup(arg1))
             if command == 'start_db_vacuum':
                 return jsonify(self._start_db_vacuum())
+            if command == 'start_db_repair':
+                return jsonify(self._start_db_repair())
             if command == 'sync_cleanup_schedule':
                 return jsonify(self._sync_cleanup_scheduler(arg1, arg2))
             if command == 'start_index_scan':

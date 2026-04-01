@@ -61,6 +61,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         'custom_root_enabled': 'False',
         'custom_root_items': '[]',
         'plex_db_path': '',
+        'plex_import_since': '',
         'transcode_codec': 'h264',
         'transcode_h264_encoder': '',
         'transcode_h265_encoder': '',
@@ -409,6 +410,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             return jsonify(self._list_items(req))
         if sub == 'search':
             return jsonify(self._search_items(req))
+        if sub == 'metadata_refresh':
+            return jsonify(self._refresh_metadata(req))
         if sub == 'play':
             return self._play(req)
         if sub == 'directplay':
@@ -661,7 +664,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 series_meta,
             )
         if series_meta:
-            item['poster_url'] = self._make_meta_art_url(req, item['path'], 'poster')
+            rev = self._metadata_cache_updated_at(item['path'])
+            item['poster_url'] = self._make_meta_art_url(req, item['path'], 'poster', rev=rev)
             item['thumb_url'] = item['poster_url']
             prefetch_series_paths.append(item['path'])
         return item
@@ -830,6 +834,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             'updated_at': int(row[8] or 0),
         }
 
+    def _metadata_cache_updated_at(self, series_rel):
+        cached = self._metadata_get_cached(series_rel)
+        return int((cached or {}).get('updated_at') or 0)
+
     def _metadata_save_cached(self, data):
         series_key = self._metadata_series_key(data.get('series_path', ''))
         self._ensure_metadata_table()
@@ -885,11 +893,13 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             return ''
         return str(value)
 
-    def _make_meta_art_url(self, req, relative_path, kind):
+    def _make_meta_art_url(self, req, relative_path, kind, rev=None):
         base = req.url_root.rstrip('/')
         query = self._request_auth_query(req)
         query['path'] = relative_path
         query['kind'] = kind
+        if rev:
+            query['rev'] = str(int(rev))
         return f'{base}/{P.package_name}/api/meta_art?{urlencode(query)}'
 
     def _make_metadata_proxy_url(self, req, image_url):
@@ -1043,6 +1053,30 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         if episode_no:
             return '{}회'.format(episode_no)
         return filename
+
+    def _format_movie_display_name(self, rel_path, filename):
+        normalized_rel = str(rel_path or '').replace('\\', '/').strip().strip('/')
+        parts = [part for part in normalized_rel.split('/') if part]
+        parent_name = parts[-2].strip() if len(parts) >= 2 else ''
+        if self._looks_like_movie_folder_name(parent_name):
+            title, year = self._normalize_series_name(parent_name)
+            if title and year:
+                return '{} ({})'.format(title, year)
+            if title:
+                return title
+            return parent_name
+        text = str(filename or '').strip()
+        year_match = re.search(r'(?<!\d)((?:19|20)\d{2})(?!\d)', text)
+        normalized_parent_title, normalized_parent_year = self._normalize_series_name(parent_name)
+        if parent_name and year_match:
+            return '{} ({})'.format(normalized_parent_title or parent_name, normalized_parent_year or year_match.group(1))
+        if normalized_parent_title and normalized_parent_year:
+            return '{} ({})'.format(normalized_parent_title, normalized_parent_year)
+        if normalized_parent_title:
+            return normalized_parent_title
+        if parent_name:
+            return parent_name
+        return self._format_episode_display_name(filename)
 
     def _episode_source_rank(self, filename):
         upper = filename.upper()
@@ -1274,6 +1308,25 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         finally:
             with self.metadata_lookup_lock:
                 self.metadata_lookup_inflight.discard(series_rel)
+
+    def _refresh_metadata(self, req):
+        relative_path = (req.args.get('path') or req.form.get('path') or '').strip()
+        if not relative_path:
+            return {'ret': 'warning', 'msg': 'path is empty'}
+        _, target = self._resolve_target_path(relative_path)
+        series_rel = relative_path if os.path.isdir(target) else os.path.dirname(relative_path).replace('\\', '/')
+        metadata = self._lookup_metadata_cache(req, series_rel, force_refresh=True)
+        if not metadata:
+            return {'ret': 'warning', 'msg': 'Metadata refresh failed'}
+        self._mark_metadata_override(series_rel)
+        return {
+            'ret': 'success',
+            'msg': 'Metadata refreshed',
+            'data': {
+                'series_path': self._metadata_series_key(series_rel),
+                'updated_at': int(metadata.get('updated_at') or 0),
+            },
+        }
 
     def _serve_meta_art(self, req):
         relative_path = req.args.get('path', '').strip()
@@ -1770,9 +1823,13 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 rel = os.path.relpath(entry.path, root).replace('\\', '/')
                 mime, _ = mimetypes.guess_type(entry.path)
                 episode_meta = metadata_enabled and self._should_attach_episode_metadata(current_rel, entry.path)
+                if metadata_enabled and self._is_movie_tree_path(current_rel):
+                    display_name = self._format_movie_display_name(rel, entry.name)
+                else:
+                    display_name = self._format_episode_display_name(entry.name) if metadata_enabled else entry.name
                 item = {
                     'name': entry.name,
-                    'display_name': entry.name if not metadata_enabled else self._format_episode_display_name(entry.name),
+                    'display_name': display_name,
                     'path': '' if rel == '.' else rel,
                     'is_dir': False,
                     'type': 'file',
@@ -1782,9 +1839,11 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                     'playable': True,
                 }
                 if episode_meta:
-                    item['thumb_url'] = self._make_meta_art_url(req, item['path'], 'thumb')
-                    item['poster_url'] = self._make_meta_art_url(req, os.path.dirname(item['path']).replace('\\', '/'), 'poster')
-                    prefetch_series_paths.append(os.path.dirname(item['path']).replace('\\', '/'))
+                    series_rel = os.path.dirname(item['path']).replace('\\', '/')
+                    rev = self._metadata_cache_updated_at(series_rel)
+                    item['thumb_url'] = self._make_meta_art_url(req, item['path'], 'thumb', rev=rev)
+                    item['poster_url'] = self._make_meta_art_url(req, series_rel, 'poster', rev=rev)
+                    prefetch_series_paths.append(series_rel)
                 file_paths.append(item['path'])
             items.append(item)
 
@@ -1885,11 +1944,13 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 if poster_url:
                     item['poster_url'] = poster_url
                 elif series_path:
-                    item['poster_url'] = self._make_meta_art_url(req, series_path, 'poster')
+                    rev = self._metadata_cache_updated_at(series_path)
+                    item['poster_url'] = self._make_meta_art_url(req, series_path, 'poster', rev=rev)
                 if thumb_url:
                     item['thumb_url'] = thumb_url
                 elif series_path:
-                    item['thumb_url'] = self._make_meta_art_url(req, series_path, 'thumb')
+                    rev = self._metadata_cache_updated_at(series_path)
+                    item['thumb_url'] = self._make_meta_art_url(req, series_path, 'thumb', rev=rev)
             items.append(item)
 
         return {

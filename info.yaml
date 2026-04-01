@@ -1,5 +1,5 @@
 title: "GDS for Kodi"
-version: "0.0.12"
+version: "0.1.0"
 package_name: "ff_kodis"
 developer: "스카J"
 description: "Kodi와 GDS 파일을 연동하는 트랜스코딩 플러그인"

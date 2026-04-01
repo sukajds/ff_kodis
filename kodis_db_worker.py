@@ -6,8 +6,11 @@ import tarfile
 import tempfile
 import time
 import traceback
-from urllib.parse import parse_qs, urlparse
-from urllib.request import Request, urlopen
+import html
+from datetime import datetime
+from urllib.parse import parse_qs, urlparse, urljoin, urlencode
+from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor
+from http.cookiejar import CookieJar
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -98,6 +101,78 @@ def write_stopped_state(metadata_db_path, message):
     )
 
 
+def stream_response_to_file(response, temp_path, metadata_db_path, log_path, message, current_name):
+    total_size = int(response.headers.get('Content-Length') or 0)
+    downloaded = 0
+    with open(temp_path, 'wb') as dst:
+        while True:
+            state = read_state(metadata_db_path)
+            if state.get('stop_requested'):
+                diagnostic_log(log_path, 'db_import:stopped during download')
+                write_stopped_state(metadata_db_path, 'DB import stopped')
+                return False
+            chunk = response.read(1024 * 512)
+            if not chunk:
+                break
+            dst.write(chunk)
+            downloaded += len(chunk)
+            write_state(
+                metadata_db_path,
+                total=total_size,
+                processed=downloaded,
+                imported=0,
+                percent=int(downloaded * 100 / total_size) if total_size > 0 else 0,
+                message=message,
+                current_path=current_name,
+            )
+    return True
+
+
+def looks_like_html_response(response, initial_bytes):
+    content_type = str(response.headers.get('Content-Type') or '').lower()
+    if 'text/html' in content_type:
+        return True
+    probe = (initial_bytes or b'').lstrip().lower()
+    return probe.startswith(b'<!doctype html') or probe.startswith(b'<html')
+
+
+def extract_google_drive_confirm_url(html_text, current_url):
+    text = html.unescape(str(html_text or ''))
+    form_matches = re.finditer(r'<form[^>]+action="([^"]+)"[^>]*>(.*?)</form>', text, re.IGNORECASE | re.DOTALL)
+    for form_match in form_matches:
+        action = form_match.group(1)
+        body = form_match.group(2) or ''
+        if 'download' not in action.lower():
+            continue
+        action_url = urljoin(current_url, action)
+        parsed_action = urlparse(action_url)
+        params = {}
+        for key, values in parse_qs(parsed_action.query or '').items():
+            if values:
+                params[key] = values[-1]
+        input_matches = re.finditer(r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"', body, re.IGNORECASE)
+        for input_match in input_matches:
+            params[input_match.group(1)] = input_match.group(2)
+        if params:
+            return '{}://{}{}?{}'.format(
+                parsed_action.scheme,
+                parsed_action.netloc,
+                parsed_action.path,
+                urlencode(params),
+            )
+    patterns = (
+        r'href="([^"]*(?:uc\?export=download|download)[^"]*confirm[^"]*)"',
+        r'action="([^"]*(?:uc\?export=download|download)[^"]*)"',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            candidate = urljoin(current_url, match.group(1))
+            if 'confirm=' in candidate or 'download?' in candidate:
+                return candidate
+    return ''
+
+
 def copy_local_db_to_temp(source_path, temp_path, metadata_db_path, log_path):
     source_size = int(os.path.getsize(source_path) or 0)
     copied = 0
@@ -129,32 +204,57 @@ def copy_local_db_to_temp(source_path, temp_path, metadata_db_path, log_path):
 def download_db_to_temp(source_url, temp_path, metadata_db_path, log_path):
     normalized_url = normalize_shared_db_url(source_url)
     diagnostic_log(log_path, 'db_import:download url={}'.format(normalized_url))
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
     request = Request(normalized_url, headers={'User-Agent': 'ff_kodis/1.0'})
-    with urlopen(request, timeout=30) as response, open(temp_path, 'wb') as dst:
-        total_size = int(response.headers.get('Content-Length') or 0)
-        downloaded = 0
-        current_name = os.path.basename(urlparse(normalized_url).path or '') or 'metadata.sqlite'
-        while True:
-            state = read_state(metadata_db_path)
-            if state.get('stop_requested'):
-                diagnostic_log(log_path, 'db_import:stopped during download')
-                write_stopped_state(metadata_db_path, 'DB import stopped')
-                return False
-            chunk = response.read(1024 * 512)
-            if not chunk:
-                break
-            dst.write(chunk)
-            downloaded += len(chunk)
-            write_state(
-                metadata_db_path,
-                total=total_size,
-                processed=downloaded,
-                imported=0,
-                percent=int(downloaded * 100 / total_size) if total_size > 0 else 0,
-                message='Downloading shared DB...',
-                current_path=current_name,
-            )
-    return True
+    with opener.open(request, timeout=30) as response:
+        current_name = os.path.basename(urlparse(response.geturl()).path or '') or 'metadata.sqlite'
+        initial_bytes = response.read(4096)
+        if looks_like_html_response(response, initial_bytes):
+            html_text = initial_bytes + response.read()
+            confirm_url = extract_google_drive_confirm_url(html_text.decode('utf-8', 'ignore'), response.geturl())
+            if not confirm_url:
+                diagnostic_log(log_path, 'db_import:download_html_without_confirm url={}'.format(response.geturl()))
+                raise Exception('Shared link did not return a direct downloadable file')
+            diagnostic_log(log_path, 'db_import:drive_confirm url={}'.format(confirm_url))
+            confirm_request = Request(confirm_url, headers={'User-Agent': 'ff_kodis/1.0'})
+            with opener.open(confirm_request, timeout=30) as confirm_response:
+                current_name = os.path.basename(urlparse(confirm_response.geturl()).path or '') or current_name or 'metadata.sqlite'
+                return stream_response_to_file(
+                    confirm_response,
+                    temp_path,
+                    metadata_db_path,
+                    log_path,
+                    'Downloading shared DB...',
+                    current_name,
+                )
+        class _PrefixedResponse(object):
+            def __init__(self, prefix, wrapped):
+                self._prefix = prefix
+                self._wrapped = wrapped
+                self.headers = wrapped.headers
+            def read(self, size=-1):
+                if self._prefix is not None:
+                    if size is None or size < 0:
+                        data = self._prefix + self._wrapped.read()
+                        self._prefix = None
+                        return data
+                    data = self._prefix[:size]
+                    self._prefix = self._prefix[size:]
+                    if len(data) < size:
+                        data += self._wrapped.read(size - len(data))
+                    if self._prefix == b'':
+                        self._prefix = None
+                    return data
+                return self._wrapped.read(size)
+        prefixed_response = _PrefixedResponse(initial_bytes, response)
+        return stream_response_to_file(
+            prefixed_response,
+            temp_path,
+            metadata_db_path,
+            log_path,
+            'Downloading shared DB...',
+            current_name,
+        )
 
 
 def extract_db_from_archive(archive_path, temp_path, metadata_db_path, log_path):
@@ -359,6 +459,130 @@ def run_vacuum(metadata_db_path, log_path):
     diagnostic_log(log_path, 'db_vacuum:complete')
 
 
+def run_repair_series_paths(metadata_db_path, log_path):
+    diagnostic_log(log_path, 'db_repair:start metadata_db_path={}'.format(metadata_db_path))
+    write_state(
+        metadata_db_path,
+        running=True,
+        finished=False,
+        stop_requested=False,
+        total=0,
+        processed=0,
+        imported=0,
+        skipped=0,
+        percent=0,
+        message='Preparing DB repair...',
+        current_path='',
+        error='',
+        started_at=int(time.time()),
+        ended_at=0,
+    )
+    with db_connect(metadata_db_path) as conn:
+        rows = conn.execute(
+            '''
+            SELECT file_path, series_path, poster_url, thumb_url
+            FROM plex_art_item
+            WHERE file_path IS NOT NULL
+              AND TRIM(file_path) != ''
+              AND file_path != series_path
+            ORDER BY updated_at DESC, rowid DESC
+            '''
+        ).fetchall()
+        total = len(rows)
+        write_state(
+            metadata_db_path,
+            conn=conn,
+            total=total,
+            processed=0,
+            imported=0,
+            skipped=0,
+            percent=0,
+            message='Repairing series paths...',
+            current_path='',
+        )
+        existing_file_paths, existing_series_paths = load_existing_paths(conn)
+        processed = 0
+        repaired = 0
+        for file_path, series_path, poster_url, thumb_url in rows:
+            state = read_state(metadata_db_path)
+            if state.get('stop_requested'):
+                write_state(
+                    metadata_db_path,
+                    conn=conn,
+                    running=False,
+                    finished=True,
+                    message='DB repair stopped',
+                    worker_pid=0,
+                    percent=int(processed * 100 / total) if total > 0 else 0,
+                    ended_at=int(time.time()),
+                )
+                return
+            processed += 1
+            file_path = file_path or ''
+            current_series_path = series_path or ''
+            new_series_path = extract_title_year_series_path(file_path)
+            if not new_series_path or new_series_path == current_series_path:
+                if processed % 50 == 0 or processed == total:
+                    write_state(
+                        metadata_db_path,
+                        conn=conn,
+                        processed=processed,
+                        imported=repaired,
+                        skipped=processed - repaired,
+                        current_path=file_path,
+                        percent=int(processed * 100 / total) if total > 0 else 0,
+                        message='Repairing series paths...',
+                    )
+                continue
+            conn.execute(
+                '''
+                UPDATE plex_art_item
+                SET series_path = ?, updated_at = ?
+                WHERE file_path = ?
+                ''',
+                (new_series_path, int(time.time()), file_path),
+            )
+            if new_series_path not in existing_file_paths:
+                conn.execute(
+                    '''
+                    INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ''',
+                    (new_series_path, new_series_path, poster_url or '', thumb_url or poster_url or '', int(time.time())),
+                )
+                existing_file_paths.add(new_series_path)
+                existing_series_paths.add(new_series_path)
+            repaired += 1
+            diagnostic_log(log_path, 'db_repair:updated file_path={} series_path={}'.format(file_path, new_series_path))
+            if processed % 50 == 0 or processed == total:
+                conn.commit()
+                write_state(
+                    metadata_db_path,
+                    conn=conn,
+                    processed=processed,
+                    imported=repaired,
+                    skipped=processed - repaired,
+                    current_path=new_series_path,
+                    percent=int(processed * 100 / total) if total > 0 else 0,
+                    message='Repairing series paths...',
+                )
+        conn.commit()
+    diagnostic_log(log_path, 'db_repair:complete processed={} repaired={}'.format(processed, repaired))
+    write_state(
+        metadata_db_path,
+        running=False,
+        finished=True,
+        stop_requested=False,
+        processed=processed,
+        imported=repaired,
+        skipped=processed - repaired,
+        worker_pid=0,
+        percent=100 if total > 0 else 0,
+        message='DB repair complete',
+        ended_at=int(time.time()),
+    )
+
+
 def ensure_tables(metadata_db_path):
     with db_connect(metadata_db_path) as conn:
         conn.execute(
@@ -520,6 +744,17 @@ def is_http_url(value):
     return text.startswith('http://') or text.startswith('https://')
 
 
+def parse_import_since(value):
+    text = str(value or '').strip()
+    if text == '':
+        return None
+    try:
+        dt = datetime.strptime(text, '%Y-%m-%d')
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
 def normalize_plex_file_to_rel(file_path):
     normalized = str(file_path or '').replace('\\', '/').strip()
     if normalized == '':
@@ -546,7 +781,41 @@ def extract_title_year_series_path(relative_path):
     for idx in range(len(dir_parts) - 1, -1, -1):
         if looks_like_title_year(dir_parts[idx]):
             return '/'.join(dir_parts[:idx + 1])
+    fallback = extract_movie_fallback_series_path(parts)
+    if fallback:
+        return fallback
     return ''
+
+
+def extract_movie_fallback_series_path(parts):
+    if not parts or parts[0] != '영화':
+        return ''
+    if len(parts) < 2:
+        return ''
+    file_name = parts[-1]
+    if not looks_like_video_filename(file_name):
+        return ''
+    parent_name = parts[-2].strip()
+    if parent_name == '' or parent_name in ('VIDEO', '영화'):
+        return ''
+    year_match = re.search(r'(?<!\d)((?:19|20)\d{2})(?!\d)', file_name)
+    if not year_match:
+        return ''
+    year = year_match.group(1)
+    if looks_like_title_year(parent_name):
+        normalized_name = parent_name
+    else:
+        normalized_name = '{} ({})'.format(parent_name, year)
+    return '/'.join(parts[:-2] + [normalized_name])
+
+
+def looks_like_video_filename(name):
+    lower_name = str(name or '').strip().lower()
+    video_exts = (
+        '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.ts', '.m2ts',
+        '.mpg', '.mpeg', '.webm', '.m4v', '.iso', '.mp2', '.mpv', '.mts',
+    )
+    return any(lower_name.endswith(ext) for ext in video_exts)
 
 
 def is_video_library_path(file_path):
@@ -621,7 +890,7 @@ def exists_dir_by_parent_listing(candidate, log_path=''):
     return False
 
 
-def count_rows(plex_db_path, log_path=''):
+def count_rows(plex_db_path, log_path='', added_since_ts=None):
     diagnostic_log(log_path, 'count_rows:start')
     query = '''
     SELECT COUNT(*)
@@ -634,8 +903,9 @@ def count_rows(plex_db_path, log_path=''):
         mp.file LIKE '%/VIDEO/%'
         OR mp.file LIKE 'VIDEO/%'
       )
+      AND (? IS NULL OR COALESCE(mi.added_at, 0) >= ?)
     '''
-    rows = KodisPlexDBHandle.select(query, plex_db_path)
+    rows = KodisPlexDBHandle.select_arg(query, (added_since_ts, added_since_ts), plex_db_path)
     diagnostic_log(log_path, 'count_rows:done rows={}'.format(len(rows or [])))
     return int(rows[0]['COUNT(*)'] or 0) if rows else 0
 
@@ -676,22 +946,25 @@ def fetch_media_item_map(plex_db_path, media_item_ids, log_path=''):
     return result
 
 
-def iter_rows(plex_db_path, log_path=''):
+def iter_rows(plex_db_path, log_path='', added_since_ts=None):
     part_query = '''
     SELECT mp.id AS part_id, mp.file AS file_path, mp.media_item_id
     FROM media_parts mp
+    JOIN media_items mdi ON mdi.id = mp.media_item_id
+    JOIN metadata_items mi ON mi.id = mdi.metadata_item_id
     WHERE mp.id > ?
       AND (
         mp.file LIKE '%/VIDEO/%'
         OR mp.file LIKE 'VIDEO/%'
       )
+      AND (? IS NULL OR COALESCE(mi.added_at, 0) >= ?)
     ORDER BY mp.id
     LIMIT ?
     '''
     batch_size = 3000
     last_id = 0
     while True:
-        rows = KodisPlexDBHandle.select_arg(part_query, (last_id, batch_size), plex_db_path)
+        rows = KodisPlexDBHandle.select_arg(part_query, (last_id, added_since_ts, added_since_ts, batch_size), plex_db_path)
         if not rows:
             break
         diagnostic_log(log_path, 'iter_rows:batch rows={} last_id={}'.format(len(rows or []), last_id))
@@ -1090,15 +1363,25 @@ def run_cleanup(metadata_db_path, gds_root, log_path, item_log_path='', cleanup_
     )
 
 
-def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path=''):
-    diagnostic_log(log_path, 'worker:start metadata_db_path={} plex_db_path={} gds_root={}'.format(metadata_db_path, plex_db_path, gds_root))
+def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path='', import_since=''):
+    added_since_ts = parse_import_since(import_since)
+    diagnostic_log(
+        log_path,
+        'worker:start metadata_db_path={} plex_db_path={} gds_root={} import_since={} added_since_ts={}'.format(
+            metadata_db_path,
+            plex_db_path,
+            gds_root,
+            import_since or '',
+            '' if added_since_ts is None else added_since_ts,
+        ),
+    )
     prepared_cleanup_paths = []
     actual_plex_db_path = plex_db_path
     try:
         actual_plex_db_path, prepared_cleanup_paths = prepare_plex_db_source(plex_db_path, metadata_db_path, log_path)
         if not actual_plex_db_path:
             return
-        total = count_rows(actual_plex_db_path, log_path)
+        total = count_rows(actual_plex_db_path, log_path, added_since_ts=added_since_ts)
         diagnostic_log(log_path, 'worker:count_rows total={}'.format(total))
         write_state(metadata_db_path, total=total, message='Scanning Plex DB...', percent=0)
         write_state(metadata_db_path, message='Opening Plex row cursor...', current_path='', percent=0)
@@ -1122,7 +1405,7 @@ def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path
             existing_file_paths, existing_series_paths = load_existing_paths(meta_conn)
             state_check_interval = 1000
             progress_commit_interval = 1000
-            for row in iter_rows(actual_plex_db_path, log_path):
+            for row in iter_rows(actual_plex_db_path, log_path, added_since_ts=added_since_ts):
                 current_part_id = int(row['part_id'] or 0)
                 if current_part_id - batch_marker >= 1000:
                     batch_marker = current_part_id
@@ -1227,18 +1510,24 @@ def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path
                         skipped += 1
                         skipped_series += 1
                     else:
-                        meta_conn.execute(
+                        cursor = meta_conn.execute(
                             '''
-                            INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
+                            INSERT OR IGNORE INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
                             VALUES (?, ?, ?, ?, ?)
                             ''',
                             (series_path, series_path, poster_url, folder_thumb_url or poster_url, now_ts),
                         )
-                        imported += 1
-                        imported_series += 1
-                        existing_file_paths.add(series_path)
-                        existing_series_paths.add(series_path)
-                        append_item_log(item_log_path, series_path)
+                        if cursor.rowcount:
+                            imported += 1
+                            imported_series += 1
+                            existing_file_paths.add(series_path)
+                            existing_series_paths.add(series_path)
+                            append_item_log(item_log_path, series_path)
+                        else:
+                            skipped += 1
+                            skipped_series += 1
+                            existing_file_paths.add(series_path)
+                            existing_series_paths.add(series_path)
 
                 if not episode_thumb_url and not episode_poster_url:
                     folder_only += 1
@@ -1259,17 +1548,22 @@ def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path
                     skipped_episode += 1
                     continue
 
-                meta_conn.execute(
+                cursor = meta_conn.execute(
                     '''
-                    INSERT INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
+                    INSERT OR IGNORE INTO plex_art_item (file_path, series_path, poster_url, thumb_url, updated_at)
                     VALUES (?, ?, ?, ?, ?)
                     ''',
                     (rel, series_path, episode_poster_url, episode_thumb_url or episode_poster_url, now_ts),
                 )
-                imported += 1
-                imported_episode += 1
-                existing_file_paths.add(rel)
-                append_item_log(item_log_path, rel)
+                if cursor.rowcount:
+                    imported += 1
+                    imported_episode += 1
+                    existing_file_paths.add(rel)
+                    append_item_log(item_log_path, rel)
+                else:
+                    skipped += 1
+                    skipped_episode += 1
+                    existing_file_paths.add(rel)
                 if processed % progress_commit_interval == 0:
                     diagnostic_log(log_path, 'worker:commit processed={} imported={} skipped={}'.format(processed, imported, skipped))
                     meta_conn.commit()
@@ -1435,10 +1729,12 @@ def main():
             run_db_import(metadata_db_path, source_path, log_path, extra_arg)
         elif mode == 'vacuum':
             run_vacuum(metadata_db_path, log_path)
+        elif mode == 'repair':
+            run_repair_series_paths(metadata_db_path, log_path)
         elif mode == 'scan':
             run_scan(metadata_db_path, os.path.abspath(source_path), gds_root, log_path, item_log_path, extra_arg)
         else:
-            run_import(metadata_db_path, source_path, gds_root, log_path, item_log_path)
+            run_import(metadata_db_path, source_path, gds_root, log_path, item_log_path, extra_arg)
     except Exception as e:
         diagnostic_log(log_path, 'worker:exception {}'.format(str(e)))
         diagnostic_log(log_path, traceback.format_exc())

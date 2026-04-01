@@ -126,11 +126,13 @@ class KodisMetadataMixin(object):
             return ''
         return str(value)
 
-    def _make_meta_art_url(self, req, relative_path, kind):
+    def _make_meta_art_url(self, req, relative_path, kind, rev=None):
         base = req.url_root.rstrip('/')
         query = self._request_auth_query(req)
         query['path'] = relative_path
         query['kind'] = kind
+        if rev:
+            query['rev'] = str(int(rev))
         return f'{base}/{P.package_name}/api/meta_art?{urlencode(query)}'
 
     def _auth_query_from_req(self, req):
@@ -239,7 +241,7 @@ class KodisMetadataMixin(object):
     def _extract_episode_keys(self, filename):
         patterns = (
             r'(?:[sS](?P<season>[0-9]{1,2}))?[eE](?P<ep>[0-9]{1,4})',
-            r'(?P<ep>\d{1,4})[회화]',
+            r'(?P<ep>\d{1,4})[\uD68C\uD654]',
         )
         keys = []
         for pattern in patterns:
@@ -469,6 +471,28 @@ class KodisMetadataMixin(object):
             with self.metadata_lookup_lock:
                 self.metadata_lookup_inflight.discard(series_rel)
 
+    def _mark_metadata_override(self, series_rel, ttl_seconds=300):
+        normalized = self._metadata_series_key(series_rel)
+        if not normalized:
+            return
+        with self.metadata_lookup_lock:
+            if not hasattr(self, '_metadata_force_until'):
+                self._metadata_force_until = {}
+            self._metadata_force_until[normalized] = int(time.time()) + int(ttl_seconds or 300)
+
+    def _should_force_metadata(self, series_rel):
+        normalized = self._metadata_series_key(series_rel)
+        if not normalized:
+            return False
+        now_ts = int(time.time())
+        with self.metadata_lookup_lock:
+            force_map = getattr(self, '_metadata_force_until', {})
+            expired = [key for key, until_ts in force_map.items() if int(until_ts or 0) <= now_ts]
+            for key in expired:
+                force_map.pop(key, None)
+            until_ts = int(force_map.get(normalized, 0) or 0)
+            return until_ts > now_ts
+
     def _serve_meta_art(self, req):
         relative_path = req.args.get('path', '').strip()
         kind = (req.args.get('kind') or 'poster').strip().lower()
@@ -476,9 +500,11 @@ class KodisMetadataMixin(object):
             abort(404)
         _, target = self._resolve_target_path(relative_path)
         series_rel = relative_path if os.path.isdir(target) else os.path.dirname(relative_path).replace('\\', '/')
-        plex_image_url = self._plex_art_lookup(relative_path, os.path.isdir(target), kind)
-        if plex_image_url:
-            return redirect(self._make_metadata_proxy_url(req, plex_image_url))
+        force_metadata = self._should_force_metadata(series_rel)
+        if not force_metadata:
+            plex_image_url = self._plex_art_lookup(relative_path, os.path.isdir(target), kind)
+            if plex_image_url:
+                return redirect(self._make_metadata_proxy_url(req, plex_image_url))
         if os.path.isdir(target):
             if not self._is_probable_series_folder(target):
                 P.logger.info('Meta art empty: not a series folder path=%s target=%s kind=%s', relative_path, target, kind)
@@ -527,7 +553,10 @@ class KodisMetadataMixin(object):
                             break
 
         if not image_url:
-            image_url = metadata.get('poster_url') or metadata.get('thumb_url') or metadata.get('fanart_url') or ''
+            if kind == 'thumb':
+                image_url = metadata.get('thumb_url') or metadata.get('poster_url') or metadata.get('fanart_url') or ''
+            else:
+                image_url = metadata.get('poster_url') or metadata.get('thumb_url') or metadata.get('fanart_url') or ''
             P.logger.info(
                 'Meta art fallback path=%s kind=%s fallback_url=%s metadata_code=%s',
                 relative_path, kind, image_url, metadata.get('metadata_code', '')
