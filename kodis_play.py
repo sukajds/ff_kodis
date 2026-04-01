@@ -620,6 +620,54 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         normalized = self._normalize_video_relative_path(path_value)
         return normalized
 
+    def _looks_like_season_folder(self, folder_name):
+        text = str(folder_name or '').strip()
+        if not text:
+            return False
+        if re.match(r'^[sS](?:eason)?[\s._-]*\d{1,2}$', text):
+            return True
+        if re.search(r'\d{1,2}\s*시즌$', text):
+            return True
+        if re.match(r'^(?:Season|시즌)[\s._-]*\d{1,2}$', text, re.IGNORECASE):
+            return True
+        return False
+
+    def _resolve_recent_series_path(self, path_value):
+        normalized = self._normalize_resume_path(path_value)
+        if not normalized or normalized == self.recent_virtual_path:
+            return ''
+
+        series_path = ''
+        try:
+            self._ensure_plex_art_table()
+            with self._metadata_db_connect(timeout=0.5) as conn:
+                row = conn.execute(
+                    '''
+                    SELECT series_path
+                    FROM plex_art_item
+                    WHERE file_path = ?
+                      AND TRIM(COALESCE(series_path, '')) != ''
+                    LIMIT 1
+                    ''',
+                    (normalized,),
+                ).fetchone()
+            series_path = self._metadata_series_key(row[0] if row else '')
+        except Exception:
+            series_path = ''
+
+        if series_path:
+            return series_path
+
+        folder_path = os.path.dirname(normalized).replace('\\', '/').strip('/')
+        if not folder_path:
+            return ''
+        folder_name = os.path.basename(folder_path.rstrip('/'))
+        if self._looks_like_season_folder(folder_name):
+            parent_path = os.path.dirname(folder_path).replace('\\', '/').strip('/')
+            if parent_path:
+                return parent_path
+        return folder_path
+
     def _recent_folder_rows(self, client_id, limit_count=20):
         self._ensure_resume_table()
         with sqlite3.connect(self._resume_db_path()) as conn:
@@ -638,10 +686,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         result = []
         seen = set()
         for path_value, _updated_at in self._recent_folder_rows(client_id, limit_count * 5):
-            normalized = self._normalize_resume_path(path_value)
-            if not normalized or normalized == self.recent_virtual_path:
-                continue
-            folder_path = os.path.dirname(normalized).replace('\\', '/').strip('/')
+            folder_path = self._resolve_recent_series_path(path_value)
             if not folder_path or folder_path in seen:
                 continue
             seen.add(folder_path)
