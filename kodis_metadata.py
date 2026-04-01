@@ -126,6 +126,44 @@ class KodisMetadataMixin(object):
             return ''
         return str(value)
 
+    def _collect_art_candidates(self, value):
+        candidates = []
+        if value is None:
+            return candidates
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                candidates.extend(self._collect_art_candidates(item))
+            return candidates
+        if isinstance(value, dict):
+            candidates.append(value)
+            for key in ('value', 'thumb', 'poster', 'fanart', 'landscape', 'url'):
+                nested = value.get(key)
+                if isinstance(nested, (list, tuple, dict)):
+                    candidates.extend(self._collect_art_candidates(nested))
+            return candidates
+        normalized = self._normalize_art_value(value)
+        if normalized:
+            candidates.append({'value': normalized})
+        return candidates
+
+    def _pick_art_candidate(self, *values, preferred_aspects=None):
+        preferred = tuple(str(item).lower() for item in (preferred_aspects or ()))
+        candidates = []
+        for value in values:
+            candidates.extend(self._collect_art_candidates(value))
+        if preferred:
+            for candidate in candidates:
+                aspect = str(candidate.get('aspect') or '').lower()
+                if aspect in preferred:
+                    normalized = self._normalize_art_value(candidate)
+                    if normalized:
+                        return normalized
+        for candidate in candidates:
+            normalized = self._normalize_art_value(candidate)
+            if normalized:
+                return normalized
+        return ''
+
     def _make_meta_art_url(self, req, relative_path, kind, rev=None):
         base = req.url_root.rstrip('/')
         query = self._request_auth_query(req)
@@ -226,16 +264,31 @@ class KodisMetadataMixin(object):
     def _extract_art_fields(self, payload):
         art = payload.get('art') if isinstance(payload, dict) else {}
         art_dict = art if isinstance(art, dict) else {}
-        art_list_value = self._normalize_art_value(art if isinstance(art, (list, tuple)) else '')
-        poster = self._normalize_art_value(
-            art_dict.get('poster') or payload.get('poster') or art_dict.get('thumb') or payload.get('thumb') or art_list_value or ''
+        poster = self._pick_art_candidate(
+            art_dict.get('poster'),
+            payload.get('poster'),
+            art_dict.get('thumb'),
+            payload.get('thumb'),
+            art,
+            preferred_aspects=('poster',),
         )
-        thumb = self._normalize_art_value(
-            art_dict.get('thumb') or payload.get('thumb') or art_list_value or poster
+        fanart = self._pick_art_candidate(
+            art_dict.get('fanart'),
+            payload.get('fanart'),
+            art_dict.get('landscape'),
+            payload.get('landscape'),
+            payload.get('thumb'),
+            art,
+            preferred_aspects=('fanart', 'landscape', 'backdrop'),
         )
-        fanart = self._normalize_art_value(
-            art_dict.get('fanart') or payload.get('fanart') or art_dict.get('landscape') or payload.get('landscape') or art_list_value or ''
-        )
+        thumb = self._pick_art_candidate(
+            art_dict.get('thumb'),
+            payload.get('thumb'),
+            art_dict.get('landscape'),
+            payload.get('landscape'),
+            art,
+            preferred_aspects=('thumb', 'landscape', 'fanart', 'backdrop', 'poster'),
+        ) or poster
         return poster, thumb, fanart
 
     def _extract_episode_keys(self, filename):
@@ -272,6 +325,17 @@ class KodisMetadataMixin(object):
 
     def _extract_episode_thumb_map(self, payload):
         result = {}
+        for episode_keys, item, source_item in self._iter_episode_payload_items(payload):
+            poster, thumb, fanart = self._extract_art_fields(source_item)
+            if not (thumb or poster or fanart):
+                poster, thumb, fanart = self._extract_art_fields(item)
+            image_url = self._normalize_art_value(thumb or poster or fanart)
+            if image_url:
+                for episode_key in episode_keys:
+                    result[episode_key] = image_url
+        return result
+
+    def _iter_episode_payload_items(self, payload):
         if isinstance(payload, dict):
             if 'episodes' in payload and isinstance(payload['episodes'], (list, dict)):
                 payload = payload['episodes']
@@ -322,15 +386,50 @@ class KodisMetadataMixin(object):
                         date_match.group('month'),
                         date_match.group('day'),
                     ))
-            if not episode_keys:
+            if episode_keys:
+                yield episode_keys, item, source_item
+
+    def _extract_episode_image_url(self, payload):
+        poster, thumb, fanart = self._extract_art_fields(payload)
+        image_url = self._normalize_art_value(thumb or poster or fanart)
+        if image_url:
+            return image_url
+        extras = payload.get('extras') if isinstance(payload, dict) else None
+        if isinstance(extras, list):
+            for extra in extras:
+                if not isinstance(extra, dict):
+                    continue
+                image_url = self._normalize_art_value(extra.get('thumb') or extra.get('poster') or extra.get('fanart'))
+                if image_url:
+                    return image_url
+        return ''
+
+    def _augment_metadata_ktv_episode_thumb_map(self, base, auth_query, episodes_payload, episode_map):
+        if not isinstance(episodes_payload, (dict, list)):
+            return episode_map
+        result = dict(episode_map or {})
+        for episode_keys, item, source_item in self._iter_episode_payload_items(episodes_payload):
+            if any(result.get(episode_key) for episode_key in episode_keys):
                 continue
-            poster, thumb, fanart = self._extract_art_fields(source_item)
-            if not (thumb or poster or fanart):
-                poster, thumb, fanart = self._extract_art_fields(item)
-            image_url = self._normalize_art_value(thumb or poster or fanart)
-            if image_url:
-                for episode_key in episode_keys:
-                    result[episode_key] = image_url
+            daum_item = item.get('daum') if isinstance(item.get('daum'), dict) else None
+            episode_code = ''
+            if daum_item:
+                episode_code = str(daum_item.get('code') or '').strip()
+            elif isinstance(source_item, dict):
+                candidate_code = str(source_item.get('code') or '').strip()
+                if candidate_code.startswith('KD') and '.' in candidate_code:
+                    episode_code = candidate_code
+            if episode_code == '':
+                continue
+            try:
+                episode_url = f"{base}/metadata/api/ktv/episode_info?{self._append_query_params(auth_query, {'code': episode_code})}"
+                episode_payload = self._fetch_json_url(episode_url)
+                image_url = self._extract_episode_image_url(episode_payload)
+                if image_url:
+                    for episode_key in episode_keys:
+                        result[episode_key] = image_url
+            except Exception:
+                continue
         return result
 
     def _lookup_metadata_cache(self, req, series_rel, force_refresh=False):
@@ -413,7 +512,10 @@ class KodisMetadataMixin(object):
                 if isinstance(info_payload.get('extra_info'), dict):
                     episodes_payload = info_payload.get('extra_info', {}).get('episodes')
                 if episodes_payload:
-                    episode_json = json.dumps(self._extract_episode_thumb_map(episodes_payload), ensure_ascii=False)
+                    episode_map = self._extract_episode_thumb_map(episodes_payload)
+                    if module_name == 'ktv':
+                        episode_map = self._augment_metadata_ktv_episode_thumb_map(base, auth_query, episodes_payload, episode_map)
+                    episode_json = json.dumps(episode_map, ensure_ascii=False) if episode_map else ''
                 elif module_name == 'ktv' and len(metadata_code) > 1 and metadata_code[1] == 'D':
                     try:
                         episode_url = f"{base}/metadata/api/ktv/episode_info?{self._append_query_params(auth_query, {'code': metadata_code})}"
