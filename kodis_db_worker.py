@@ -211,27 +211,42 @@ def prepare_plex_db_source(plex_db_path, metadata_db_path, log_path):
     if source_path == '':
         raise Exception('Plex DB path is empty')
     if not looks_like_archive_file(source_path):
-        return source_path, None
+        return source_path, []
     metadata_dir = os.path.dirname(os.path.abspath(metadata_db_path)) or None
+    archive_suffix = '.tar.gz' if source_path.lower().endswith('.tar.gz') else '.tgz'
+    archive_fd, archive_temp_path = tempfile.mkstemp(prefix='ff_kodis_plex_source_', suffix=archive_suffix, dir=metadata_dir)
+    os.close(archive_fd)
     temp_fd, temp_path = tempfile.mkstemp(prefix='ff_kodis_plex_source_', suffix='.sqlite', dir=metadata_dir)
     os.close(temp_fd)
-    ok = extract_db_from_archive(source_path, temp_path, metadata_db_path, log_path)
+    diagnostic_log(log_path, 'plex_import:copy_archive_to_local source_path={} temp_path={}'.format(source_path, archive_temp_path))
+    ok = copy_local_db_to_temp(source_path, archive_temp_path, metadata_db_path, log_path)
     if not ok:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-        return None, None
+        for cleanup_path in (archive_temp_path, temp_path):
+            if os.path.exists(cleanup_path):
+                try:
+                    os.remove(cleanup_path)
+                except Exception:
+                    pass
+        return None, []
+    ok = extract_db_from_archive(archive_temp_path, temp_path, metadata_db_path, log_path)
+    if not ok:
+        for cleanup_path in (archive_temp_path, temp_path):
+            if os.path.exists(cleanup_path):
+                try:
+                    os.remove(cleanup_path)
+                except Exception:
+                    pass
+        return None, []
     if not looks_like_sqlite_file(temp_path):
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+        for cleanup_path in (archive_temp_path, temp_path):
+            if os.path.exists(cleanup_path):
+                try:
+                    os.remove(cleanup_path)
+                except Exception:
+                    pass
         raise Exception('Extracted file is not a valid SQLite database')
     diagnostic_log(log_path, 'plex_import:using_extracted_db path={}'.format(temp_path))
-    return temp_path, temp_path
+    return temp_path, [archive_temp_path, temp_path]
 
 
 def run_db_import(metadata_db_path, source_path, log_path, source_url=''):
@@ -1077,10 +1092,10 @@ def run_cleanup(metadata_db_path, gds_root, log_path, item_log_path='', cleanup_
 
 def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path=''):
     diagnostic_log(log_path, 'worker:start metadata_db_path={} plex_db_path={} gds_root={}'.format(metadata_db_path, plex_db_path, gds_root))
-    prepared_db_path = None
+    prepared_cleanup_paths = []
     actual_plex_db_path = plex_db_path
     try:
-        actual_plex_db_path, prepared_db_path = prepare_plex_db_source(plex_db_path, metadata_db_path, log_path)
+        actual_plex_db_path, prepared_cleanup_paths = prepare_plex_db_source(plex_db_path, metadata_db_path, log_path)
         if not actual_plex_db_path:
             return
         total = count_rows(actual_plex_db_path, log_path)
@@ -1300,11 +1315,12 @@ def run_import(metadata_db_path, plex_db_path, gds_root, log_path, item_log_path
             ended_at=int(time.time()),
         )
     finally:
-        if prepared_db_path and os.path.exists(prepared_db_path):
-            try:
-                os.remove(prepared_db_path)
-            except Exception:
-                pass
+        for cleanup_path in prepared_cleanup_paths:
+            if cleanup_path and os.path.exists(cleanup_path):
+                try:
+                    os.remove(cleanup_path)
+                except Exception:
+                    pass
 
 
 def run_scan(metadata_db_path, scan_root_path, gds_root, log_path, item_log_path='', exclude_text=''):
