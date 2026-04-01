@@ -504,7 +504,7 @@ class PlexImportMixin(object):
         rel = str(relative_path or '').replace('\\', '/').strip().strip('/')
         if not rel:
             return ''
-        lookup_rel = rel[6:].strip('/') if rel.startswith('VIDEO/') else rel
+        lookup_rel = self._normalize_plex_file_to_rel(rel) or rel
         self._ensure_plex_art_table()
         with self._metadata_db_connect() as conn:
             if is_dir:

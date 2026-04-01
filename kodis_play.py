@@ -561,28 +561,43 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             }
         return result
 
-    def _normalize_resume_path(self, path_value):
+    def _normalize_video_relative_path(self, path_value):
         normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
         if normalized == '':
             return ''
         upper = normalized.upper()
-        marker = '/VIDEO/'
-        marker_index = upper.find(marker)
-        if marker_index >= 0:
-            return normalized[marker_index + len(marker):].strip('/')
-        if upper.endswith('/VIDEO'):
+        for marker in ('/GDRIVE/VIDEO/', '/VIDEO/'):
+            marker_index = upper.find(marker)
+            if marker_index >= 0:
+                return normalized[marker_index + len(marker):].strip('/')
+        for prefix in ('GDRIVE/VIDEO/', 'VIDEO/'):
+            if upper.startswith(prefix):
+                return normalized[len(prefix):].strip('/')
+        if upper in ('GDRIVE/VIDEO', 'VIDEO'):
             return ''
-        if normalized.upper().startswith('VIDEO/'):
-            return normalized[6:].strip('/')
-        if normalized.upper() == 'VIDEO':
+        return normalized
+
+    def _video_root_path(self, root=None):
+        root_abs = os.path.abspath(root or P.ModelSetting.get('gds_path') or '')
+        if not root_abs:
             return ''
-        gds_root = str(P.ModelSetting.get('gds_path') or '').replace('\\', '/').strip().rstrip('/')
-        if gds_root:
-            gds_root_upper = gds_root.upper()
-            if upper.startswith(gds_root_upper + '/'):
-                return normalized[len(gds_root):].strip('/')
-            if upper == gds_root_upper:
-                return ''
+        candidates = []
+        if os.path.basename(os.path.normpath(root_abs)).upper() == 'VIDEO':
+            candidates.append(root_abs)
+        candidates.append(os.path.join(root_abs, 'VIDEO'))
+        candidates.append(os.path.join(root_abs, 'GDRIVE', 'VIDEO'))
+        seen = set()
+        for candidate in candidates:
+            candidate_abs = os.path.abspath(candidate)
+            if candidate_abs in seen:
+                continue
+            seen.add(candidate_abs)
+            if os.path.isdir(candidate_abs):
+                return candidate_abs
+        return candidates[0] if candidates else root_abs
+
+    def _normalize_resume_path(self, path_value):
+        normalized = self._normalize_video_relative_path(path_value)
         return normalized
 
     def _recent_folder_rows(self, client_id, limit_count=20):
@@ -1348,26 +1363,21 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return redirect(self._make_metadata_proxy_url(req, image_url))
 
     def _resolve_target_path(self, relative_path=''):
-        root = os.path.abspath(P.ModelSetting.get('gds_path') or '')
-        if not root:
+        configured_root = os.path.abspath(P.ModelSetting.get('gds_path') or '')
+        if not configured_root:
             raise Exception('gds_path is empty')
-        if not self._run_with_timeout('gds_root_exists', lambda: os.path.exists(root), timeout_seconds=5):
+        if not self._run_with_timeout('gds_root_exists', lambda: os.path.exists(configured_root), timeout_seconds=5):
             raise Exception('gds_path does not exist')
-        candidate = os.path.abspath(os.path.join(root, relative_path or ''))
+        root = self._video_root_path(configured_root)
+        relative_norm = self._normalize_video_relative_path(relative_path)
+        candidate = os.path.abspath(os.path.join(root, relative_norm or ''))
         if os.path.commonpath([root, candidate]) != root:
             raise Exception('invalid path')
         return root, candidate
 
     def _resolve_recent_folder_target(self, root, folder_rel):
-        normalized_rel = str(folder_rel or '').replace('\\', '/').strip().strip('/')
-        direct_target = os.path.join(root, normalized_rel.replace('/', os.sep))
-        if self._run_with_timeout('recent_direct_target_isdir', lambda: os.path.isdir(direct_target), timeout_seconds=5):
-            return direct_target
-        if os.path.basename(os.path.normpath(root)).upper() != 'VIDEO':
-            video_target = os.path.join(root, 'VIDEO', normalized_rel.replace('/', os.sep))
-            if self._run_with_timeout('recent_video_target_isdir', lambda: os.path.isdir(video_target), timeout_seconds=5):
-                return video_target
-        return direct_target
+        normalized_rel = self._normalize_video_relative_path(folder_rel)
+        return os.path.join(root, normalized_rel.replace('/', os.sep))
 
     def _custom_root_enabled(self):
         value = str(P.ModelSetting.get('custom_root_enabled') or 'False').strip().lower()
@@ -1393,35 +1403,20 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return result
 
     def _custom_root_relative_path(self, root, path_value):
-        root_abs = os.path.abspath(root)
-        target_abs = os.path.abspath(str(path_value or '').strip())
-        if not target_abs:
+        video_root = self._video_root_path(root)
+        raw_path = str(path_value or '').strip()
+        if raw_path == '':
             return ''
+        normalized_rel = self._normalize_video_relative_path(raw_path)
+        if normalized_rel != raw_path.replace('\\', '/').strip().strip('/'):
+            return normalized_rel
+        target_abs = os.path.abspath(raw_path)
         try:
-            if os.path.commonpath([root_abs, target_abs]) == root_abs:
-                rel = os.path.relpath(target_abs, root_abs).replace('\\', '/')
+            if os.path.commonpath([video_root, target_abs]) == video_root:
+                rel = os.path.relpath(target_abs, video_root).replace('\\', '/')
                 return '' if rel == '.' else rel.strip('/')
         except Exception:
             return None
-
-        if os.path.basename(os.path.normpath(root_abs)).upper() != 'VIDEO':
-            video_root = os.path.join(root_abs, 'VIDEO')
-            try:
-                if os.path.commonpath([video_root, target_abs]) == video_root:
-                    rel = os.path.relpath(target_abs, root_abs).replace('\\', '/')
-                    return '' if rel == '.' else rel.strip('/')
-            except Exception:
-                return None
-
-        normalized_target = target_abs.replace('\\', '/').strip()
-        upper_target = normalized_target.upper()
-        marker = '/VIDEO/'
-        marker_index = upper_target.find(marker)
-        if marker_index >= 0:
-            tail = normalized_target[marker_index + 1:].strip('/')
-            if os.path.basename(os.path.normpath(root_abs)).upper() == 'VIDEO':
-                return tail[6:].strip('/') if tail.upper().startswith('VIDEO/') else tail
-            return tail
         return None
 
     def _custom_root_display_name(self, item, path_value):
