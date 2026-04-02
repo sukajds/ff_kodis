@@ -3071,6 +3071,14 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
         if normalized.startswith('VIDEO/'):
             normalized = normalized[6:]
+        else:
+            upper_parts = [part.strip().upper() for part in normalized.split('/') if part.strip()]
+            try:
+                video_index = upper_parts.index('VIDEO')
+                raw_parts = [part.strip() for part in normalized.split('/') if part.strip()]
+                normalized = '/'.join(raw_parts[video_index + 1:])
+            except ValueError:
+                pass
         parts = [part.strip() for part in normalized.split('/') if part.strip()]
         if not parts:
             return False
