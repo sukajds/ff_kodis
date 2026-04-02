@@ -3015,6 +3015,13 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
         subtitle_paths = self._find_subtitle_paths(target, root)
         subtitle_urls = [self._make_subtitle_url(req, p) for p in subtitle_paths]
+        P.logger.info(
+            'Play subtitle selection path=%s mode=%s allowed=%s subtitle_paths=%s',
+            file_path,
+            mode,
+            self._should_allow_external_subtitles(target),
+            subtitle_paths,
+        )
 
         if mode == 'directplay':
             stream_url = self._make_directplay_url(req, file_path)
