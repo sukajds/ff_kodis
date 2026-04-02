@@ -3055,6 +3055,106 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         response.headers['X-KodiGds-VodPlaylist'] = playlist_url
         return response
 
+    def _subtitle_language_kind(self, filename):
+        lower = str(filename or '').lower()
+        korean_tokens = ('korean', 'kor', '.ko', '_ko', '-ko', ' ko', '한국어', '한글')
+        english_tokens = ('english', 'eng', '.en', '_en', '-en', ' en', 'sdh', 'cc')
+        if any(token in lower for token in korean_tokens):
+            return 'korean'
+        if any(token in lower for token in english_tokens):
+            return 'english'
+        if re.search(r'(?i)(?:[ ._\-\[\(])(jpn|jp|chs|cht|cn|sc|tc)(?=$|[ ._\-\]\)])', lower):
+            return 'other'
+        return 'unknown'
+
+    def _should_allow_external_subtitles(self, path_value):
+        normalized = str(path_value or '').replace('\\', '/').strip().strip('/')
+        if normalized.startswith('VIDEO/'):
+            normalized = normalized[6:]
+        parts = [part.strip() for part in normalized.split('/') if part.strip()]
+        if not parts:
+            return False
+        top_parts = parts[:4]
+        if any(part == '영화' or '영화' in part for part in top_parts):
+            return True
+        foreign_tv_exact = ('외국TV', '해외TV', '외국', '해외')
+        foreign_tv_tokens = (
+            '미드', '일드', '중드', '영드',
+            '미국 드라마', '일본 드라마', '중국 드라마',
+            '해외드라마', '외국드라마',
+        )
+        if any(part in foreign_tv_exact for part in top_parts):
+            return True
+        if any(token in part for part in top_parts for token in foreign_tv_tokens):
+            return True
+        return False
+
+    def _subtitle_language_score(self, filename):
+        score_map = {
+            'korean': 20,
+            'english': 5,
+            'unknown': 0,
+            'other': 0,
+        }
+        score = score_map.get(self._subtitle_language_kind(filename), 0)
+        if 'forced' in str(filename or '').lower():
+            score -= 5
+        return score
+
+    def _find_subtitle_paths(self, video_path, root):
+        """Return only matching external subtitles for allowed movie/foreign-series paths."""
+        allow_subtitles = self._should_allow_external_subtitles(video_path)
+        folder = os.path.dirname(video_path)
+        result = []
+        try:
+            subtitle_entries = []
+            for entry in sorted(os.scandir(folder), key=lambda x: x.name.lower()):
+                if entry.is_file() and self._is_supported_subtitle_file(entry.name):
+                    subtitle_entries.append(entry)
+            if not subtitle_entries:
+                return result
+
+            if not allow_subtitles:
+                P.logger.info('Subtitle export blocked path=%s reason=category', video_path)
+                return result
+
+            scored = []
+            for entry in subtitle_entries:
+                score = self._score_subtitle_match(video_path, entry.name)
+                if score is None:
+                    continue
+                rel = os.path.relpath(entry.path, root).replace('\\', '/')
+                scored.append((score, rel, entry.name, self._subtitle_language_kind(entry.name)))
+            if not scored:
+                return result
+
+            korean_scored = [item for item in scored if item[3] == 'korean']
+            unknown_scored = [item for item in scored if item[3] == 'unknown']
+            if korean_scored:
+                scored = korean_scored
+            elif unknown_scored:
+                scored = unknown_scored
+            else:
+                P.logger.info(
+                    'Subtitle export skipped path=%s reason=no_korean_candidates names=%s',
+                    video_path,
+                    [item[2] for item in scored],
+                )
+                return result
+
+            scored.sort(key=lambda item: (-item[0], item[2].lower()))
+            top_score = scored[0][0]
+            minimum_score = 150 if len(subtitle_entries) > 1 else 0
+            for score, rel, _name, _lang_kind in scored:
+                if score < minimum_score:
+                    continue
+                if score + 50 < top_score:
+                    continue
+                result.append(rel)
+        except Exception:
+            pass
+        return result
+
     def _probe_video(self, target, ffmpeg_path):
         ffprobe_path = self._resolve_ffprobe_path(ffmpeg_path)
         cmd = [
