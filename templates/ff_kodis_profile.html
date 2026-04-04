@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+
+{{ macros.m_button_group([['localSettingSaveBtn', '설정 저장']])}}
+{{ macros.m_row_start('5') }}
+{{ macros.m_row_end() }}
+{{ macros.m_hr() }}
+
+<form id="profile_setting" name="profile_setting">
+  <input type="hidden" id="profiles_json" name="profiles_json" value='{{ arg["profiles_json"]|e }}'>
+
+  <div class="form-group">
+    <label class="col-sm-3 control-label">프로필 안내</label>
+    <div class="col-sm-9">
+      <div class="form-control-static">
+        프로필은 1~5까지 고정입니다. 프로필 ID가 실제 접속 키로 사용됩니다.
+      </div>
+    </div>
+  </div>
+
+  {% for profile in arg['profiles'] %}
+  <div class="profile-block" data-profile-index="{{ loop.index0 }}" data-profile-id="{{ profile['profile_id'] }}">
+    {{ macros.setting_checkbox('profile_enabled_' ~ loop.index0, '프로필 ' ~ loop.index, value=profile['enabled'], desc=None) }}
+    <div id="profile_enabled_{{ loop.index0 }}_div" class="collapse{% if profile['enabled'] %} show{% endif %} profile-collapse">
+      {{ macros.setting_input_text('profile_name_' ~ loop.index0, '프로필 이름', value=profile['name'], desc=None) }}
+      {{ macros.setting_input_text('profile_id_' ~ loop.index0, '프로필 ID', value=profile['password'], desc=['Kodi 애드온에서 입력하는 프로필 ID입니다.']) }}
+      {{ macros.setting_checkbox('profile_show_av_' ~ loop.index0, 'AV 표시 여부', value=profile['show_av'], desc=None) }}
+      {{ macros.setting_checkbox('profile_use_custom_root_' ~ loop.index0, '편집 목록 사용', value=profile.get('use_custom_root', False), desc=['On이면 편집 목록을, Off이면 기본 루트를 표시합니다.']) }}
+      {{ macros.m_hr() }}
+    </div>
+  </div>
+  {% endfor %}
+</form>
+
+<script type="text/javascript">
+function readToggleState($checkbox) {
+  if ($checkbox.is(':checked')) {
+    return true;
+  }
+  var $toggle = $checkbox.closest('.toggle');
+  if ($toggle.length) {
+    return !$toggle.hasClass('off');
+  }
+  return false;
+}
+
+function collectProfilesFromDom() {
+  var rows = [];
+  $('#profile_setting .profile-block').each(function(index) {
+    rows.push({
+      profile_id: String($(this).attr('data-profile-id') || '').trim() || ('profile_' + (index + 1)),
+      name: String($('#profile_name_' + index).val() || '').trim() || ('프로필' + (index + 1)),
+      password: String($('#profile_id_' + index).val() || '').trim(),
+      enabled: readToggleState($('#profile_enabled_' + index)),
+      show_av: readToggleState($('#profile_show_av_' + index)),
+      use_custom_root: readToggleState($('#profile_use_custom_root_' + index))
+    });
+  });
+  return rows;
+}
+
+function validateProfiles(rows) {
+  var usedIds = {};
+  for (var i = 0; i < rows.length; i += 1) {
+    var profile = rows[i];
+    if (!profile.enabled) {
+      continue;
+    }
+    var allowBlankProfileId = (String(profile.profile_id || '').trim() === 'profile_1');
+    if (!profile.password && !allowBlankProfileId) {
+      $.notify('<strong>실패</strong><br>사용 중인 프로필의 프로필 ID를 입력해주세요.', {type: 'warning'});
+      return false;
+    }
+    if (!profile.password && allowBlankProfileId) {
+      continue;
+    }
+    if (usedIds[profile.password]) {
+      $.notify('<strong>실패</strong><br>프로필 ID는 중복될 수 없습니다.', {type: 'warning'});
+      return false;
+    }
+    usedIds[profile.password] = true;
+  }
+  return true;
+}
+
+function saveProfiles(rows) {
+  $('#profiles_json').val(JSON.stringify(rows));
+  $.ajax({
+    url: '/' + PACKAGE_NAME + '/ajax/profile/command',
+    type: 'POST',
+    cache: false,
+    data: {
+      command: 'save_profiles',
+      arg1: $('#profiles_json').val(),
+      arg2: null,
+      arg3: null
+    },
+    dataType: 'json',
+    success: function(data) {
+      if (data.ret === 'success') {
+        $.notify('<strong>설정을 저장하였습니다.</strong>', {type: 'success'});
+      } else {
+        $.notify('<strong>설정 저장에 실패하였습니다.</strong><br>' + (data.msg || '알 수 없는 오류'), {type: 'warning'});
+      }
+    },
+    error: function(xhr) {
+      $.notify('<strong>설정 저장에 실패하였습니다.</strong><br>' + (xhr.responseText || 'request failed'), {type: 'warning'});
+    }
+  });
+}
+
+document.addEventListener('click', function(e) {
+  const target = e.target.closest('#localSettingSaveBtn');
+  if (!target) return;
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+  var rows = collectProfilesFromDom();
+  if (!validateProfiles(rows)) {
+    return;
+  }
+  saveProfiles(rows);
+}, true);
+
+$("body").on('change', 'input[id^="profile_enabled_"]', function() {
+  $(this).closest('.profile-block').find('.profile-collapse').collapse($(this).is(':checked') ? 'show' : 'hide');
+});
+</script>
+
+{% endblock %}

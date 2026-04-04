@@ -69,6 +69,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         'ffmpeg_path': 'ffmpeg',
         'gds_path': '',
         'access_password': '',
+        'profiles_json': '[]',
+        'db_tree_schedule_enabled': 'False',
+        'db_tree_schedule': '',
         'custom_root_enabled': 'False',
         'custom_root_items': '[]',
         'plex_db_path': '',
@@ -86,7 +89,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             pass
         self.series_folder_probe_lock = threading.Lock()
         self.series_folder_probe_cache = {}
-        self._start_db_tree_worker()
+        self._db_tree_scheduler_synced = False
 
     def _diagnostic_log_path(self):
         log_dir = os.path.join(F.config['path_data'], 'log')
@@ -454,44 +457,178 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         os.makedirs(db_dir, exist_ok=True)
         return os.path.join(db_dir, 'resume.sqlite')
 
+    def _request_profile_id(self, req):
+        profile = self._get_request_profile(req) if hasattr(self, '_get_request_profile') else None
+        if profile:
+            return str(profile.get('profile_id') or '').strip()
+        return ''
+
+    def _bootstrap_resume_migration(self):
+        try:
+            self._ensure_resume_table()
+            P.logger.info('Resume bootstrap migration check completed')
+        except Exception as e:
+            P.logger.warning('Resume bootstrap migration failed: %s', str(e))
+
     def _ensure_resume_table(self):
         with sqlite3.connect(self._resume_db_path()) as conn:
-            conn.execute(
-                '''
-                CREATE TABLE IF NOT EXISTS resume_item (
-                    client_id TEXT NOT NULL,
-                    path TEXT NOT NULL,
-                    position_seconds REAL NOT NULL DEFAULT 0,
-                    duration REAL NOT NULL DEFAULT 0,
-                    play_state TEXT NOT NULL DEFAULT '',
-                    updated_at INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (client_id, path)
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if 'resume_item' not in tables:
+                conn.execute(
+                    '''
+                    CREATE TABLE IF NOT EXISTS resume_item (
+                        profile_id TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        position_seconds REAL NOT NULL DEFAULT 0,
+                        duration REAL NOT NULL DEFAULT 0,
+                        play_state TEXT NOT NULL DEFAULT '',
+                        updated_at INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (profile_id, path)
+                    )
+                    '''
                 )
-                '''
-            )
-            columns = [row[1] for row in conn.execute("PRAGMA table_info(resume_item)").fetchall()]
-            if 'play_state' not in columns:
-                conn.execute("ALTER TABLE resume_item ADD COLUMN play_state TEXT NOT NULL DEFAULT ''")
+            else:
+                columns = [row[1] for row in conn.execute("PRAGMA table_info(resume_item)").fetchall()]
+                if 'profile_id' not in columns:
+                    conn.execute('ALTER TABLE resume_item RENAME TO resume_item_legacy')
+                    conn.execute(
+                        '''
+                        CREATE TABLE resume_item (
+                            profile_id TEXT NOT NULL,
+                            path TEXT NOT NULL,
+                            position_seconds REAL NOT NULL DEFAULT 0,
+                            duration REAL NOT NULL DEFAULT 0,
+                            play_state TEXT NOT NULL DEFAULT '',
+                            updated_at INTEGER NOT NULL DEFAULT 0,
+                            PRIMARY KEY (profile_id, path)
+                        )
+                        '''
+                    )
+                    rows = conn.execute(
+                        '''
+                        SELECT path, position_seconds, duration, play_state, MAX(updated_at)
+                        FROM resume_item_legacy
+                        GROUP BY path
+                        '''
+                    ).fetchall()
+                    default_profile_id = self._default_resume_profile_id()
+                    if default_profile_id:
+                        conn.executemany(
+                            '''
+                            INSERT OR REPLACE INTO resume_item
+                                (profile_id, path, position_seconds, duration, play_state, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ''',
+                            [
+                                (
+                                    default_profile_id,
+                                    row[0] or '',
+                                    float(row[1] or 0.0),
+                                    float(row[2] or 0.0),
+                                    row[3] or '',
+                                    int(row[4] or 0),
+                                )
+                                for row in rows
+                                if str(row[0] or '').strip()
+                            ],
+                        )
+                    conn.execute('DROP TABLE resume_item_legacy')
+                else:
+                    if 'play_state' not in columns:
+                        conn.execute("ALTER TABLE resume_item ADD COLUMN play_state TEXT NOT NULL DEFAULT ''")
             self._migrate_resume_paths(conn)
             conn.commit()
+
+    def _default_resume_profile_id(self):
+        profiles = self._load_profiles() if hasattr(self, '_load_profiles') else []
+        if not profiles:
+            return ''
+        return str((profiles[0] or {}).get('profile_id') or '').strip()
+
+    def _migrate_legacy_default_profile(self, conn):
+        default_profile_id = self._default_resume_profile_id()
+        if not default_profile_id or default_profile_id == 'legacy-default':
+            P.logger.info('Resume legacy migration skipped target_profile_id=%s', default_profile_id)
+            return False
+        row = conn.execute(
+            '''
+            SELECT COUNT(*)
+            FROM resume_item
+            WHERE profile_id = ?
+            ''',
+            ('legacy-default',),
+        ).fetchone()
+        legacy_count = int((row[0] if row else 0) or 0)
+        if legacy_count <= 0:
+            P.logger.info(
+                'Resume legacy migration skipped target_profile_id=%s legacy_rows=0',
+                default_profile_id,
+            )
+            return False
+        rows = conn.execute(
+            '''
+            SELECT path, position_seconds, duration, play_state, updated_at
+            FROM resume_item
+            WHERE profile_id = ?
+            ''',
+            ('legacy-default',),
+        ).fetchall()
+        for path_value, position_seconds, duration, play_state, updated_at in rows:
+            conn.execute(
+                '''
+                INSERT INTO resume_item (profile_id, path, position_seconds, duration, play_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, path) DO UPDATE SET
+                    position_seconds = CASE
+                        WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.position_seconds
+                        ELSE resume_item.position_seconds
+                    END,
+                    duration = CASE
+                        WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.duration
+                        ELSE resume_item.duration
+                    END,
+                    play_state = CASE
+                        WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.play_state
+                        ELSE resume_item.play_state
+                    END,
+                    updated_at = CASE
+                        WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.updated_at
+                        ELSE resume_item.updated_at
+                    END
+                ''',
+                (default_profile_id, path_value, position_seconds, duration, play_state, updated_at),
+            )
+        conn.execute(
+            '''
+            DELETE FROM resume_item
+            WHERE profile_id = ?
+            ''',
+            ('legacy-default',),
+        )
+        P.logger.info(
+            'Resume legacy migration completed source_profile_id=legacy-default target_profile_id=%s rows=%s',
+            default_profile_id,
+            legacy_count,
+        )
+        return True
 
     def _migrate_resume_paths(self, conn):
         try:
             rows = conn.execute(
                 '''
-                SELECT client_id, path, position_seconds, duration, play_state, updated_at
+                SELECT profile_id, path, position_seconds, duration, play_state, updated_at
                 FROM resume_item
                 '''
             ).fetchall()
-            for client_id, path_value, position_seconds, duration, play_state, updated_at in rows:
+            for profile_id, path_value, position_seconds, duration, play_state, updated_at in rows:
                 normalized = self._normalize_resume_path(path_value)
                 if not normalized or normalized == path_value:
                     continue
                 conn.execute(
                     '''
-                    INSERT INTO resume_item (client_id, path, position_seconds, duration, play_state, updated_at)
+                    INSERT INTO resume_item (profile_id, path, position_seconds, duration, play_state, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(client_id, path) DO UPDATE SET
+                    ON CONFLICT(profile_id, path) DO UPDATE SET
                         position_seconds = CASE
                             WHEN excluded.updated_at >= resume_item.updated_at THEN excluded.position_seconds
                             ELSE resume_item.position_seconds
@@ -509,16 +646,17 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                             ELSE resume_item.updated_at
                         END
                     ''',
-                    (client_id, normalized, position_seconds, duration, play_state, updated_at),
+                    (profile_id, normalized, position_seconds, duration, play_state, updated_at),
                 )
                 conn.execute(
-                    'DELETE FROM resume_item WHERE client_id = ? AND path = ?',
-                    (client_id, path_value),
+                    'DELETE FROM resume_item WHERE profile_id = ? AND path = ?',
+                    (profile_id, path_value),
                 )
+            self._migrate_legacy_default_profile(conn)
         except Exception as e:
             P.logger.warning('Resume path migration failed: %s', str(e))
 
-    def _get_resume_state(self, client_id, path_value):
+    def _get_resume_state(self, profile_id, path_value):
         path_value = self._normalize_resume_path(path_value)
         self._ensure_resume_table()
         with sqlite3.connect(self._resume_db_path()) as conn:
@@ -526,9 +664,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 '''
                 SELECT position_seconds, duration, play_state, updated_at
                 FROM resume_item
-                WHERE client_id = ? AND path = ?
+                WHERE profile_id = ? AND path = ?
                 ''',
-                (client_id, path_value),
+                (profile_id, path_value),
             ).fetchone()
         position_seconds = float(row[0]) if row else 0.0
         duration = float(row[1]) if row else 0.0
@@ -537,7 +675,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         watched = play_state == 'watched'
         in_progress = (not watched) and position_seconds > 0
         return {
-            'client_id': client_id,
+            'profile_id': profile_id,
             'path': path_value,
             'position_seconds': 0.0 if watched else position_seconds,
             'duration': duration,
@@ -547,7 +685,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             'play_state': play_state,
         }
 
-    def _get_resume_state_map(self, client_id, path_values):
+    def _get_resume_state_map(self, profile_id, path_values):
         normalized = []
         for path in path_values:
             normalized_path = self._normalize_resume_path(path)
@@ -557,10 +695,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             return {}
         self._ensure_resume_table()
         placeholders = ','.join(['?'] * len(normalized))
-        params = [client_id] + normalized
+        params = [profile_id] + normalized
         query = (
             'SELECT path, position_seconds, duration, play_state, updated_at '
-            'FROM resume_item WHERE client_id = ? AND path IN ({})'
+            'FROM resume_item WHERE profile_id = ? AND path IN ({})'
         ).format(placeholders)
         result = {}
         with sqlite3.connect(self._resume_db_path()) as conn:
@@ -668,24 +806,59 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 return parent_path
         return folder_path
 
-    def _recent_folder_rows(self, client_id, limit_count=20):
+    def _recent_folder_rows(self, profile_id, limit_count=20):
         self._ensure_resume_table()
         with sqlite3.connect(self._resume_db_path()) as conn:
             rows = conn.execute(
                 '''
                 SELECT path, updated_at
                 FROM resume_item
-                WHERE client_id = ?
+                WHERE profile_id = ?
                 ORDER BY updated_at DESC
                 ''',
-                (client_id,),
+                (profile_id,),
             ).fetchall()
         return rows[: max(int(limit_count or 0), 0)]
 
-    def _recent_folder_paths(self, client_id, limit_count=20):
+    def _get_recent_folder_latest_map(self, root, folder_paths):
+        db_path = self._gds_tool_db_path()
+        if not os.path.exists(db_path):
+            return {}
+        targets = {}
+        for folder_rel in folder_paths:
+            rel = self._normalize_video_relative_path(folder_rel)
+            if not rel:
+                continue
+            target_abs = self._resolve_recent_folder_target(root, rel)
+            virtual_prefix = self._make_gds_virtual_path(root, target_abs).rstrip('/') + '/'
+            if virtual_prefix:
+                targets[rel] = virtual_prefix
+        if not targets:
+            return {}
+        result = dict((rel, 0) for rel in targets.keys())
+        try:
+            with sqlite3.connect(db_path) as conn:
+                for rel, prefix in targets.items():
+                    row = conn.execute(
+                        '''
+                        SELECT MAX(created_time)
+                        FROM fp_item
+                        WHERE gds_path IS NOT NULL
+                          AND gds_path != ''
+                          AND (scan_mode IS NULL OR UPPER(scan_mode) = 'ADD')
+                          AND gds_path LIKE ?
+                        ''',
+                        (prefix + '%',),
+                    ).fetchone()
+                    result[rel] = self._parse_series_sort_time((row[0] if row else 0) or 0)
+        except Exception as e:
+            P.logger.warning(f'Failed to read gds_tool.db for recent folder sort: {str(e)}')
+        return result
+
+    def _recent_folder_paths(self, profile_id, limit_count=20, sort_mode='viewed', root=None):
         result = []
         seen = set()
-        for path_value, _updated_at in self._recent_folder_rows(client_id, limit_count * 5):
+        for path_value, _updated_at in self._recent_folder_rows(profile_id, limit_count * 5):
             folder_path = self._resolve_recent_series_path(path_value)
             if not folder_path or folder_path in seen:
                 continue
@@ -693,15 +866,38 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             result.append(folder_path)
             if len(result) >= limit_count:
                 break
+        if str(sort_mode or '').strip().lower() == 'latest' and root:
+            latest_map = self._get_recent_folder_latest_map(root, result)
+            result.sort(key=lambda rel: (-int(latest_map.get(rel, 0) or 0), rel.lower()))
         return result
 
-    def _should_hide_entry(self, current_rel, entry):
+    def _delete_resume_profile(self, profile_id):
+        target = str(profile_id or '').strip()
+        if target == '':
+            return 0
+        self._ensure_resume_table()
+        with sqlite3.connect(self._resume_db_path()) as conn:
+            row = conn.execute('SELECT COUNT(*) FROM resume_item WHERE profile_id = ?', (target,)).fetchone()
+            deleted = int((row[0] if row else 0) or 0)
+            conn.execute('DELETE FROM resume_item WHERE profile_id = ?', (target,))
+            conn.commit()
+        return deleted
+
+    def _should_hide_entry(self, current_rel, entry, req=None):
         if current_rel != '':
             return False
-        show_av = str(P.ModelSetting.get('show_av') or 'True').strip().lower() in ('true', '1', 'yes', 'on')
+        show_av = self._show_av_enabled(req=req)
         if show_av:
             return False
         return entry.is_dir() and str(entry.name or '').strip().upper() == 'AV'
+
+    def _show_av_enabled(self, req=None, profile=None):
+        target_profile = profile
+        if target_profile is None and req is not None and hasattr(self, '_get_request_profile'):
+            target_profile = self._get_request_profile(req)
+        if isinstance(target_profile, dict) and ('show_av' in target_profile):
+            return bool(target_profile.get('show_av', False))
+        return False
 
     def _build_dir_item(self, req, root, entry, current_rel, metadata_enabled, prefetch_series_paths):
         rel = os.path.relpath(entry.path, root).replace('\\', '/')
@@ -732,10 +928,12 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             prefetch_series_paths.append(item['path'])
         return item
 
-    def _list_recent_items(self, req, root, metadata_enabled, client_id, recent_limit=20):
+    def _list_recent_items(self, req, root, metadata_enabled, profile_id, recent_limit=20, recent_item_sort_mode='viewed'):
         items = []
         prefetch_series_paths = []
-        for folder_rel in self._recent_folder_paths(client_id, recent_limit):
+        for folder_rel in self._recent_folder_paths(profile_id, recent_limit, recent_item_sort_mode, root):
+            if not self._path_allowed_for_profile(req, root, folder_rel):
+                continue
             target_path = self._resolve_recent_folder_target(root, folder_rel)
             if not os.path.isdir(target_path):
                 continue
@@ -765,16 +963,42 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             }
         }
 
+    def _path_allowed_for_profile(self, req, root, relative_path):
+        if not self._custom_root_enabled(req=req):
+            return True
+        normalized_target = self._normalize_video_relative_path(relative_path)
+        if normalized_target == '':
+            return True
+        allowed_prefixes = []
+        profile_id = self._request_profile_id(req)
+        for config_item in self._custom_root_items():
+            allowed_profiles = config_item.get('profiles') or []
+            if profile_id and allowed_profiles and profile_id not in allowed_profiles:
+                continue
+            relative_path = self._custom_root_relative_path(root, config_item.get('path', ''))
+            if relative_path is None:
+                continue
+            normalized_prefix = self._normalize_video_relative_path(relative_path)
+            if normalized_prefix == '':
+                continue
+            allowed_prefixes.append(normalized_prefix)
+        if not allowed_prefixes:
+            return False
+        for prefix in allowed_prefixes:
+            if normalized_target == prefix or normalized_target.startswith(prefix + '/'):
+                return True
+        return False
+
     def _resume_get(self, req):
-        client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
+        profile_id = self._request_profile_id(req)
         path_value = self._normalize_resume_path(req.args.get('path') or req.form.get('path') or '')
         if not path_value:
-            return {'ret': 'success', 'data': {'position_seconds': 0, 'duration': 0, 'client_id': client_id, 'watched': False, 'in_progress': False, 'play_state': ''}}
-        data = self._get_resume_state(client_id, path_value)
+            return {'ret': 'success', 'data': {'position_seconds': 0, 'duration': 0, 'profile_id': profile_id, 'watched': False, 'in_progress': False, 'play_state': ''}}
+        data = self._get_resume_state(profile_id, path_value)
         return {'ret': 'success', 'data': data}
 
     def _resume_set(self, req):
-        client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
+        profile_id = self._request_profile_id(req)
         path_value = self._normalize_resume_path(req.args.get('path') or req.form.get('path') or '')
         position_seconds = self._parse_start_seconds(req.args.get('position_seconds') or req.form.get('position_seconds') or '0')
         duration = self._parse_start_seconds(req.args.get('duration') or req.form.get('duration') or '0')
@@ -789,45 +1013,65 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         watched_ratio = ((position_seconds / duration) * 100.0) if duration > 0 else 0.0
         should_mark_watched = duration > 0 and watched_ratio >= watched_percent
         should_clear = clear_flag or position_seconds <= 0
+        P.logger.info(
+            'Resume set requested profile_id=%s path=%s position=%.3f duration=%.3f watched_percent=%.3f watched_ratio=%.3f clear=%s mark_watched=%s',
+            profile_id,
+            path_value,
+            position_seconds,
+            duration,
+            watched_percent,
+            watched_ratio,
+            should_clear,
+            should_mark_watched,
+        )
 
         with sqlite3.connect(self._resume_db_path()) as conn:
             if should_mark_watched:
                 conn.execute(
                     '''
-                    INSERT INTO resume_item (client_id, path, position_seconds, duration, play_state, updated_at)
+                    INSERT INTO resume_item (profile_id, path, position_seconds, duration, play_state, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(client_id, path) DO UPDATE SET
+                    ON CONFLICT(profile_id, path) DO UPDATE SET
                         position_seconds = excluded.position_seconds,
                         duration = excluded.duration,
                         play_state = excluded.play_state,
                         updated_at = excluded.updated_at
                     ''',
-                    (client_id, path_value, 0.0, duration, 'watched', int(time.time())),
+                    (profile_id, path_value, 0.0, duration, 'watched', int(time.time())),
                 )
             elif should_clear:
                 conn.execute(
-                    'DELETE FROM resume_item WHERE client_id = ? AND path = ?',
-                    (client_id, path_value),
+                    'DELETE FROM resume_item WHERE profile_id = ? AND path = ?',
+                    (profile_id, path_value),
                 )
             else:
                 conn.execute(
                     '''
-                    INSERT INTO resume_item (client_id, path, position_seconds, duration, play_state, updated_at)
+                    INSERT INTO resume_item (profile_id, path, position_seconds, duration, play_state, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(client_id, path) DO UPDATE SET
+                    ON CONFLICT(profile_id, path) DO UPDATE SET
                         position_seconds = excluded.position_seconds,
                         duration = excluded.duration,
                         play_state = excluded.play_state,
                         updated_at = excluded.updated_at
                     ''',
-                    (client_id, path_value, position_seconds, duration, 'resume', int(time.time())),
+                    (profile_id, path_value, position_seconds, duration, 'resume', int(time.time())),
                 )
             conn.commit()
+
+        P.logger.info(
+            'Resume set stored profile_id=%s path=%s play_state=%s stored_position=%.3f stored_duration=%.3f',
+            profile_id,
+            path_value,
+            'watched' if should_mark_watched else ('' if should_clear else 'resume'),
+            0.0 if (should_clear or should_mark_watched) else position_seconds,
+            duration,
+        )
 
         return {
             'ret': 'success',
             'data': {
-                'client_id': client_id,
+                'profile_id': profile_id,
                 'path': path_value,
                 'position_seconds': 0.0 if (should_clear or should_mark_watched) else position_seconds,
                 'duration': duration,
@@ -1660,9 +1904,15 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
 
     def _resolve_recent_folder_target(self, root, folder_rel):
         normalized_rel = self._normalize_video_relative_path(folder_rel)
-        return os.path.join(root, normalized_rel.replace('/', os.sep))
+        base_root = self._video_root_path(root)
+        return os.path.join(base_root, normalized_rel.replace('/', os.sep))
 
-    def _custom_root_enabled(self):
+    def _custom_root_enabled(self, req=None, profile=None):
+        target_profile = profile
+        if target_profile is None and req is not None and hasattr(self, '_get_request_profile'):
+            target_profile = self._get_request_profile(req)
+        if isinstance(target_profile, dict) and ('use_custom_root' in target_profile):
+            return bool(target_profile.get('use_custom_root', False))
         value = str(P.ModelSetting.get('custom_root_enabled') or 'False').strip().lower()
         return value in ('true', '1', 'yes', 'on', 'y')
 
@@ -1679,9 +1929,13 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             path_value = str(item.get('path') or '').strip()
             if not path_value:
                 continue
+            profiles = item.get('profiles')
+            if not isinstance(profiles, list) or not profiles:
+                profiles = ['profile_1', 'profile_2', 'profile_3', 'profile_4', 'profile_5']
             result.append({
                 'name': str(item.get('name') or '').strip(),
                 'path': path_value,
+                'profiles': [str(x).strip() for x in profiles if str(x).strip()],
             })
         return result
 
@@ -1710,6 +1964,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return os.path.basename(normalized) or normalized
 
     def _list_custom_root_items(self, req, root, metadata_enabled):
+        profile_id = self._request_profile_id(req)
         items = [{
             'name': '최근 재생항목',
             'display_name': '최근 재생항목',
@@ -1723,6 +1978,9 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         }]
         prefetch_series_paths = []
         for config_item in self._custom_root_items():
+            allowed_profiles = config_item.get('profiles') or []
+            if profile_id and allowed_profiles and profile_id not in allowed_profiles:
+                continue
             relative_path = self._custom_root_relative_path(root, config_item.get('path', ''))
             if relative_path is None:
                 continue
@@ -1802,12 +2060,20 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 )
                 '''
             )
+            columns = [row[1] for row in conn.execute("PRAGMA table_info('db_tree_state')").fetchall()]
+            if 'show_av_enabled' not in columns:
+                conn.execute(
+                    '''
+                    ALTER TABLE db_tree_state
+                    ADD COLUMN show_av_enabled INTEGER NOT NULL DEFAULT 1
+                    '''
+                )
             conn.execute(
                 '''
                 INSERT OR IGNORE INTO db_tree_state (
                     id, source_max_updated_at, source_row_count, source_series_count,
-                    source_deleted_at, source_deleted_count, rebuilt_at
-                ) VALUES (1, 0, 0, 0, 0, 0, 0)
+                    source_deleted_at, source_deleted_count, rebuilt_at, show_av_enabled
+                ) VALUES (1, 0, 0, 0, 0, 0, 0, 1)
                 '''
             )
             conn.commit()
@@ -1880,6 +2146,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             'source_series_count': int((row[2] if row else 0) or 0) + int((discovered_row[1] if discovered_row else 0) or 0),
             'source_deleted_at': int((cleanup_row[0] if cleanup_row else 0) or 0),
             'source_deleted_count': int((cleanup_row[1] if cleanup_row else 0) or 0),
+            'show_av_enabled': 1,
         }
 
     def _get_saved_db_tree_signature(self, conn):
@@ -1887,7 +2154,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             '''
             SELECT
                 source_max_updated_at, source_row_count, source_series_count,
-                source_deleted_at, source_deleted_count
+                source_deleted_at, source_deleted_count, show_av_enabled
             FROM db_tree_state
             WHERE id = 1
             '''
@@ -1898,6 +2165,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             'source_series_count': int((row[2] if row else 0) or 0),
             'source_deleted_at': int((row[3] if row else 0) or 0),
             'source_deleted_count': int((row[4] if row else 0) or 0),
+            'show_av_enabled': int((row[5] if row else 1) or 0),
         }
 
     def _get_db_tree_rebuilt_at(self, conn):
@@ -1946,6 +2214,61 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 type(self).db_tree_refresh_inflight,
             )
 
+    def _db_tree_scheduler_job_id(self):
+        return f'{P.package_name}_db_tree_json'
+
+    def _db_tree_schedule_expression(self):
+        return str(P.ModelSetting.get('db_tree_schedule') or '').strip()
+
+    def _sync_db_tree_scheduler(self, enabled_override=None, schedule_override=None):
+        if enabled_override is not None:
+            enabled_text = str(enabled_override).strip().lower()
+            enabled_value = 'True' if enabled_text in ('true', '1', 'on', 'yes') else 'False'
+            P.ModelSetting.set('db_tree_schedule_enabled', enabled_value)
+        if schedule_override is not None:
+            P.ModelSetting.set('db_tree_schedule', str(schedule_override or '').strip())
+        job_id = self._db_tree_scheduler_job_id()
+        enabled = str(P.ModelSetting.get('db_tree_schedule_enabled') or 'False').lower() == 'true'
+        schedule = self._db_tree_schedule_expression()
+        if F.scheduler.is_include(job_id):
+            F.scheduler.remove_job(job_id)
+        if (not enabled) or schedule == '':
+            P.logger.info('DB tree scheduler disabled')
+            return {'ret': 'success', 'msg': 'DB 파일트리 자동 생성이 비활성화되었습니다.'}
+        job = Job(P.package_name, job_id, schedule, self._scheduled_db_tree_job, 'ff_kodis DB tree json')
+        F.scheduler.add_job_instance(job)
+        P.logger.info('DB tree scheduler registered schedule=%s', schedule)
+        return {'ret': 'success', 'msg': 'DB 파일트리 자동 생성 스케줄을 저장했습니다.'}
+
+    def _scheduled_db_tree_job(self):
+        result = self._build_db_tree_json_now()
+        P.logger.info(
+            'DB tree scheduled job finished ret=%s rebuilt=%s exported=%s',
+            result.get('ret'),
+            (result.get('data') or {}).get('rebuilt'),
+            (result.get('data') or {}).get('exported'),
+        )
+
+    def _build_db_tree_json_now(self):
+        rebuilt = False
+        exported = False
+        try:
+            rebuilt = bool(self._refresh_db_tree_cache(force=True))
+            exported = bool(self._ensure_db_tree_json_cache(force=True))
+            return {
+                'ret': 'success',
+                'msg': 'DB 파일트리 JSON 생성을 완료했습니다.',
+                'data': {
+                    'rebuilt': rebuilt,
+                    'exported': exported,
+                    'schedule': self._db_tree_schedule_expression(),
+                },
+            }
+        except Exception as e:
+            P.logger.error('DB tree manual build failed: %s', str(e))
+            P.logger.error(traceback.format_exc())
+            return {'ret': 'danger', 'msg': str(e)}
+
     def _iter_db_tree_series_paths(self, conn):
         seen = set()
         queries = (
@@ -1983,15 +2306,6 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         processed = 0
         for series_path in self._iter_db_tree_series_paths(conn):
             processed += 1
-            if processed == 1 or processed % 500 == 0:
-                parent_hint = os.path.dirname(series_path).replace('\\', '/').strip('/')
-                if not parent_hint:
-                    parent_hint = series_path
-                P.logger.info(
-                    'DB tree rebuild progress processed=%s parent=%s',
-                    processed,
-                    parent_hint,
-                )
             parts = [part.strip() for part in series_path.split('/') if part.strip()]
             if not parts:
                 continue
@@ -2042,9 +2356,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         for row in rows:
             path_value = row[0] or ''
             parent_path = row[1] or ''
+            name = row[2] or ''
             item = {
-                'name': row[2] or '',
-                'display_name': row[2] or '',
+                'name': name,
+                'display_name': name,
                 'path': path_value,
                 'is_dir': True,
                 'type': 'dir',
@@ -2061,9 +2376,22 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 'version': 1,
                 'generated_at': int(time.time()),
                 'rebuilt_at': int(rebuilt_at or 0),
+                'ttl_seconds': int(self._db_tree_json_ttl_seconds()),
                 'items_by_parent': items_by_parent,
             },
         }
+
+    def _db_tree_json_ttl_seconds(self):
+        enabled = str(P.ModelSetting.get('db_tree_schedule_enabled') or 'False').strip().lower() == 'true'
+        if not enabled:
+            return int(self.db_tree_json_refresh_interval or 1200)
+        schedule = self._db_tree_schedule_expression()
+        if str(schedule or '').strip().isdigit():
+            try:
+                return max(60, int(str(schedule).strip()) * 60)
+            except Exception:
+                return int(self.db_tree_json_refresh_interval or 1200)
+        return int(self.db_tree_json_refresh_interval or 1200)
 
     def _db_tree_json_needs_refresh(self, rebuilt_at):
         target = self._db_tree_json_path()
@@ -2155,7 +2483,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 '''
                 UPDATE db_tree_state
                 SET source_max_updated_at = ?, source_row_count = ?, source_series_count = ?,
-                    source_deleted_at = ?, source_deleted_count = ?, rebuilt_at = ?
+                    source_deleted_at = ?, source_deleted_count = ?, rebuilt_at = ?, show_av_enabled = ?
                 WHERE id = 1
                 ''',
                 (
@@ -2165,6 +2493,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                     current['source_deleted_at'],
                     current['source_deleted_count'],
                     rebuilt_at,
+                    current['show_av_enabled'],
                 ),
             )
             conn.commit()
@@ -2314,6 +2643,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 'path': target_path,
                 'is_dir': lambda self=None: True,
             })()
+            if self._should_hide_entry(normalized_rel, entry, req=req):
+                continue
             item = self._build_dir_item(req, root, entry, normalized_rel, metadata_enabled, prefetch_series_paths)
             item['name'] = child['name']
             item['display_name'] = child['name']
@@ -2566,9 +2897,21 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 continue
         return 0
 
+    def _episode_sort_key(self, filename):
+        episode_no, air_date = self._extract_episode_display_parts(filename)
+        episode_value = -1
+        if str(episode_no or '').strip().isdigit():
+            try:
+                episode_value = int(str(episode_no).strip())
+            except Exception:
+                episode_value = -1
+        air_value = self._parse_series_sort_time(air_date + ' 00:00:00') if air_date else 0
+        return (episode_value, air_value)
+
     def _list_items(self, req):
         relative_path = req.args.get('path', '') if hasattr(req, 'args') else ''
         recent_sort_mode = (req.args.get('recent_sort_mode') or 'latest').strip().lower()
+        recent_item_sort_mode = (req.args.get('recent_item_sort_mode') or 'viewed').strip().lower()
         metadata_enabled = self._req_bool(req, 'metadata_enabled', True)
         recent_limit = req.args.get('recent_limit') or req.form.get('recent_limit') or '20'
         try:
@@ -2576,12 +2919,12 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         except Exception:
             recent_limit = 20
         recent_limit = max(1, min(recent_limit, 200))
-        client_id = (req.args.get('client_id') or req.form.get('client_id') or 'default').strip() or 'default'
+        profile_id = self._request_profile_id(req)
         if str(relative_path or '').strip().strip('/') == self.recent_virtual_path:
             root, _ = self._resolve_target_path('')
-            return self._list_recent_items(req, root, metadata_enabled, client_id, recent_limit)
+            return self._list_recent_items(req, root, metadata_enabled, profile_id, recent_limit, recent_item_sort_mode)
         root, target = self._resolve_target_path(relative_path)
-        if str(relative_path or '').strip().strip('/') == '' and self._custom_root_enabled():
+        if str(relative_path or '').strip().strip('/') == '' and self._custom_root_enabled(req=req):
             return self._list_custom_root_items(req, root, metadata_enabled)
         current_rel = os.path.relpath(target, root).replace('\\', '/')
         if current_rel == '.':
@@ -2595,7 +2938,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         items = []
         entries = self._run_with_timeout(
             'list_target_scandir',
-            lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry)],
+            lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry, req=req)],
             timeout_seconds=8,
         )
         if self._is_recent_episode_sort_target(current_rel):
@@ -2624,7 +2967,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         series_recent_map = {}
         if recent_sort_mode == 'latest' and self._is_recent_sort_target(current_rel):
             series_recent_map = self._get_series_recent_map(root, target, entries)
-        file_recent_sort = recent_sort_mode == 'latest' and self._is_recent_episode_sort_target(current_rel)
+        episode_sort_target = metadata_enabled and self._is_recent_episode_sort_target(current_rel)
+        file_recent_sort = recent_sort_mode == 'latest' and episode_sort_target
         prefetch_series_paths = []
         file_paths = []
 
@@ -2633,10 +2977,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 recent = series_recent_map.get(entry.path, 0)
                 return (0, -recent, entry.name.lower())
             if file_recent_sort:
-                try:
-                    return (1, -entry.stat().st_mtime, entry.name.lower())
-                except Exception:
-                    pass
+                episode_value, air_value = self._episode_sort_key(entry.name)
+                return (1, -episode_value, -air_value, entry.name.lower())
             return (1, 0, entry.name.lower())
 
         for entry in sorted(entries, key=sort_key):
@@ -2683,7 +3025,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
                 'playable': False,
             })
 
-        resume_map = self._get_resume_state_map(client_id, file_paths)
+        resume_map = self._get_resume_state_map(profile_id, file_paths)
         for item in items:
             if item.get('is_dir'):
                 continue
@@ -2747,6 +3089,8 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         for row in rows:
             series_path = (row[0] or '').replace('\\', '/').strip().strip('/')
             if not series_path or series_path in seen:
+                continue
+            if not self._path_allowed_for_profile(req, self._video_root_path(), series_path):
                 continue
             seen.add(series_path)
             display_name = os.path.basename(series_path) or series_path

@@ -4,25 +4,18 @@
 {{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장']])}}
 {{ macros.m_row_start('5') }}
 {{ macros.m_row_end() }}
+{{ macros.m_hr() }}
 
 <nav>
   {{ macros.m_tab_head_start() }}
-    {{ macros.m_tab_head('auth', '인증', true) }}
+    {{ macros.m_tab_head('auth', '기본', true) }}
     {{ macros.m_tab_head('play', '재생', false) }}
   {{ macros.m_tab_head_end() }}
 </nav>
 
-<form id='setting' name='setting'>
+<form id="setting" name="setting">
   <div class="tab-content" id="nav-tabContent">
     {{ macros.m_tab_content_start('auth', true) }}
-      {{ macros.setting_input_text_and_buttons(
-        'access_password',
-        '접속 비밀번호',
-        [['generate_password_btn', '자동 생성']],
-        value=arg['access_password'],
-        desc=['비워 두면 비활성화됩니다', 'Kodi 애드온에도 동일한 비밀번호를 입력해야 합니다']
-      ) }}
-
       {{ macros.setting_input_text_and_buttons(
         'gds_path',
         'GDS 경로',
@@ -30,6 +23,26 @@
         value=arg['gds_path'],
         desc=['Kodi에 노출할 GDS 루트 경로', 'plex_mate처럼 시스템 폴더 선택기를 사용합니다']
       ) }}
+
+      {{ macros.setting_checkbox(
+        'db_tree_schedule_enabled',
+        'DB 파일트리 자동생성 사용',
+        value=arg.get('db_tree_schedule_enabled', 'False'),
+        desc=['현재 스케줄 등록 상태: ' + ('등록됨' if arg.get('db_tree_schedule_active') else '해제됨')]
+      ) }}
+      <div id="db_tree_schedule_wrap" class="collapse{% if arg.get('db_tree_schedule_enabled', 'False') == 'True' %} show{% endif %}">
+        {{ macros.setting_input_text_and_buttons(
+          'db_tree_schedule',
+          'DB 파일트리 스케줄',
+          [['build_db_tree_json_now_btn', '수동생성']],
+          value=arg.get('db_tree_schedule', ''),
+          desc=[
+            '숫자를 입력하면 분 단위 Interval, 크론값을 입력하면 Cron으로 등록합니다',
+            '예: 20 또는 0 */4 * * *',
+            '빈칸이면 자동 생성하지 않습니다'
+          ]
+        ) }}
+      </div>
     {{ macros.m_tab_content_end() }}
 
     {{ macros.m_tab_content_start('play', false) }}
@@ -49,25 +62,17 @@
         value=arg['transcode_codec'],
         desc='Kodi가 트랜스코딩을 요청할 때 사용할 기본 코덱'
       ) }}
-
-      {{ macros.setting_checkbox(
-        'show_av',
-        'AV 표시 여부',
-        value=arg['show_av'],
-        desc=['끄면 /VIDEO/AV 폴더를 최상위 목록에서 숨깁니다']
-      ) }}
     {{ macros.m_tab_content_end() }}
   </div>
 </form>
 
 <script type="text/javascript">
 function saveGdsPathSelection() {
-  var formData = getFormdata('#setting');
   $.ajax({
     url: '/' + package_name + '/ajax/setting_save',
     type: 'POST',
     cache: false,
-    data: formData,
+    data: {gds_path: $('#gds_path').val()},
     dataType: 'json',
     success: function(ret) {
       if (ret) {
@@ -82,9 +87,49 @@ function saveGdsPathSelection() {
   });
 }
 
+function toggleDbTreeScheduleFields() {
+  if ($('#db_tree_schedule_enabled').is(':checked')) {
+    $('#db_tree_schedule_wrap').collapse('show');
+  } else {
+    $('#db_tree_schedule_wrap').collapse('hide');
+  }
+}
+
 $("body").on('click', '#ffmpeg_version_btn', function(e){
   e.preventDefault();
   globalSendCommand('ffmpeg_version');
+});
+
+$("body").on('click', '#build_db_tree_json_now_btn', function(e){
+  e.preventDefault();
+  globalSendCommand('build_db_tree_json_now', null, null, null, function(data){
+    if (data.ret === 'success') {
+      $.notify('<strong>완료</strong><br>' + (data.msg || 'DB 파일트리 JSON 생성을 완료했습니다.'), {type: 'success'});
+    }
+  });
+});
+
+$("body").on('change', '#db_tree_schedule_enabled', function(){
+  toggleDbTreeScheduleFields();
+});
+
+$(document).ajaxSuccess(function(_event, xhr, settings) {
+  if (!settings || !settings.url) {
+    return;
+  }
+  if (settings.url.indexOf('/ajax/setting_save') === -1) {
+    return;
+  }
+  if (xhr.responseJSON !== true) {
+    return;
+  }
+  var dbTreeEnabled = $('#db_tree_schedule_enabled').is(':checked') ? 'True' : 'False';
+  var schedule = ($('#db_tree_schedule').val() || '').trim();
+  globalSendCommand('sync_db_tree_schedule', dbTreeEnabled, schedule, null, function(data) {
+    if (data.ret !== 'success') {
+      $.notify('<strong>실패</strong><br>' + (data.msg || '알 수 없는 오류'), {type: 'warning'});
+    }
+  });
 });
 
 $("body").on('click', '#test_transcode_encoder_btn', function(e){
@@ -109,24 +154,14 @@ $("body").on('click', '#test_transcode_encoder_btn', function(e){
 
 $("body").on('click', '#select_gds_path_btn', function(e){
   e.preventDefault();
-  var path = '/mnt/gds/GDRIVE/';
-  globalSelectLocalFolder("GDS 루트 폴더 선택", path, function(result){
+  globalSelectLocalFolder('GDS 루트 폴더 선택', '/mnt/gds/GDRIVE/', function(result){
     $('#gds_path').val(result);
     saveGdsPathSelection();
   });
 });
 
-$("body").on('click', '#generate_password_btn', function(e){
-  e.preventDefault();
-  globalSendCommand('generate_password', null, null, null, function(data){
-    if (data.ret !== 'success') {
-      $.notify('<strong>실패</strong><br>' + (data.msg || '알 수 없는 오류'), {type: 'warning'});
-      return;
-    }
-    var password = data.data && data.data.access_password ? data.data.access_password : '';
-    $('#access_password').val(password);
-    $.notify('<strong>완료</strong><br>새 비밀번호가 생성되었습니다.', {type: 'success'});
-  });
+$(document).ready(function() {
+  toggleDbTreeScheduleFields();
 });
 </script>
 

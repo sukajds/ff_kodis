@@ -344,6 +344,7 @@ $("body").on('click', '#select_index_scan_path_btn', function(e){
 
 $(document).ready(function(){
   $('#gds_import_source').prop('readonly', true);
+  $('#gds_import_source').prop('disabled', true);
   var excludeInput = $('#index_scan_exclude');
   var excludeRawValue = {{ (arg.get('index_scan_exclude', '') or '') | tojson }};
   if (excludeInput.length && excludeInput.prop('tagName').toLowerCase() === 'input') {

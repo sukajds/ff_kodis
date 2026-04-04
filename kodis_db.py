@@ -994,6 +994,7 @@ class ModuleDb(PlexImportMixin, PluginModuleBase):
         'index_scan_path': '',
         'index_scan_exclude': '',
         'plex_db_path': '',
+        'gds_import_source': '내장 gds_tool.db 사용',
         'plex_import_since': '',
         'kodis_db_url': '',
         'db_cleanup_path': '',

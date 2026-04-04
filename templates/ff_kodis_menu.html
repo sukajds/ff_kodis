@@ -3,22 +3,20 @@
 
 <script src="{{ url_for('static', filename='js/Sortable.js') }}"></script>
 
-{{ macros.m_button_group([['globalSettingSaveBtn', '설정 저장']])}}
+{{ macros.m_button_group([['localSettingSaveBtn', '설정 저장']])}}
 {{ macros.m_row_start('5') }}
 {{ macros.m_row_end() }}
 
-<form id='setting' name='setting'>
-  {{ macros.setting_checkbox(
-    'custom_root_enabled',
-    '목록 편집',
-    value=arg['custom_root_enabled'],
-    desc=['끄면 기존 GDS 루트 목록을 그대로 사용합니다', '켜면 아래 항목들만 Kodi 메인에 노출됩니다']
-  ) }}
-
-  <div id="custom_root_items_wrap" class="collapse">
+<form id='menu_setting' name='menu_setting'>
+  <div id="custom_root_items_wrap">
     <input type="hidden" id="custom_root_items" name="custom_root_items" value='{{ arg["custom_root_items"]|e }}'>
     <div class="custom-root-panel border rounded p-3">
       <div class="form-group row mb-2 custom-root-header-row">
+        <div class="custom-root-profile-col"><strong>P1</strong></div>
+        <div class="custom-root-profile-col"><strong>P2</strong></div>
+        <div class="custom-root-profile-col"><strong>P3</strong></div>
+        <div class="custom-root-profile-col"><strong>P4</strong></div>
+        <div class="custom-root-profile-col"><strong>P5</strong></div>
         <div class="custom-root-name-col"><strong>항목이름</strong></div>
         <div class="custom-root-path-col"><strong>경로</strong></div>
         <div class="custom-root-action-col action-header"><strong>정렬</strong></div>
@@ -26,7 +24,7 @@
       <div id="custom_root_items_container"></div>
     </div>
     <div class="form-text text-muted custom-root-help">
-      항목이름을 비워 두면 경로의 마지막 폴더명을 자동으로 사용합니다.
+      각 프로필별로 표시/숨김을 설정할 수 있습니다. 항목이름을 비워 두면 경로의 마지막 폴더명을 자동으로 사용합니다.
     </div>
   </div>
 </form>
@@ -34,6 +32,21 @@
 <template id="custom_root_item_template">
   <div class="custom-root-item py-1">
     <div class="form-group row mb-1 custom-root-row">
+      <div class="custom-root-profile-col">
+        <input type="checkbox" class="custom-root-profile" value="profile_1" title="{{ arg['fixed_profiles'][0]['name'] if arg['fixed_profiles']|length > 0 else '프로필1' }}">
+      </div>
+      <div class="custom-root-profile-col">
+        <input type="checkbox" class="custom-root-profile" value="profile_2" title="{{ arg['fixed_profiles'][1]['name'] if arg['fixed_profiles']|length > 1 else '프로필2' }}">
+      </div>
+      <div class="custom-root-profile-col">
+        <input type="checkbox" class="custom-root-profile" value="profile_3" title="{{ arg['fixed_profiles'][2]['name'] if arg['fixed_profiles']|length > 2 else '프로필3' }}">
+      </div>
+      <div class="custom-root-profile-col">
+        <input type="checkbox" class="custom-root-profile" value="profile_4" title="{{ arg['fixed_profiles'][3]['name'] if arg['fixed_profiles']|length > 3 else '프로필4' }}">
+      </div>
+      <div class="custom-root-profile-col">
+        <input type="checkbox" class="custom-root-profile" value="profile_5" title="{{ arg['fixed_profiles'][4]['name'] if arg['fixed_profiles']|length > 4 else '프로필5' }}">
+      </div>
       <div class="custom-root-name-col">
         <input type="text" class="form-control custom-root-name">
       </div>
@@ -77,13 +90,19 @@
 }
 
 .custom-root-name-col {
-  flex: 0 0 155px;
-  max-width: 155px;
+  flex: 0 0 150px;
+  max-width: 150px;
 }
 
 .custom-root-path-col {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.custom-root-profile-col {
+  flex: 0 0 20px;
+  max-width: 20px;
+  text-align: center;
 }
 
 .custom-root-action-col {
@@ -94,6 +113,17 @@
 .custom-root-header-row .custom-root-action-col.action-header {
   width: 210px;
   text-align: center;
+}
+
+.custom-root-profile-col input[type="checkbox"] {
+  appearance: auto !important;
+  -webkit-appearance: checkbox !important;
+  position: static !important;
+  opacity: 1 !important;
+  width: 14px !important;
+  height: 14px !important;
+  margin: 0 !important;
+  vertical-align: middle;
 }
 
 .custom-root-path-col .input-group {
@@ -134,23 +164,19 @@ var customRootItems = {{ arg['custom_root_items_list']|tojson }};
 var lastCustomRootPickerPath = '/mnt/gds/GDRIVE/VIDEO';
 var customRootSortable = null;
 
-function toggleCustomRootEditor() {
-  if ($('#custom_root_enabled').is(':checked')) {
-    $('#custom_root_items_wrap').collapse('show');
-  } else {
-    $('#custom_root_items_wrap').collapse('hide');
-  }
-}
-
 function syncCustomRootItems() {
   var rows = [];
   $('#custom_root_items_container .custom-root-item').each(function() {
     var name = $(this).find('.custom-root-name').val().trim();
     var path = $(this).find('.custom-root-path').val().trim();
+    var profiles = [];
+    $(this).find('.custom-root-profile:checked').each(function() {
+      profiles.push($(this).val());
+    });
     if (path === '') {
       return;
     }
-    rows.push({name: name, path: path});
+    rows.push({name: name, path: path, profiles: profiles});
   });
   $('#custom_root_items').val(JSON.stringify(rows));
 }
@@ -158,6 +184,10 @@ function syncCustomRootItems() {
 function bindCustomRow($row, item) {
   $row.find('.custom-root-name').val(item && item.name ? item.name : '');
   $row.find('.custom-root-path').val(item && item.path ? item.path : '');
+  var profiles = Array.isArray(item && item.profiles) && item.profiles.length ? item.profiles : ['profile_1', 'profile_2', 'profile_3', 'profile_4', 'profile_5'];
+  $row.find('.custom-root-profile').each(function() {
+    $(this).prop('checked', profiles.indexOf($(this).val()) !== -1);
+  });
 }
 
 function collectCustomRootItems() {
@@ -165,7 +195,8 @@ function collectCustomRootItems() {
   $('#custom_root_items_container .custom-root-item').each(function() {
     rows.push({
       name: $(this).find('.custom-root-name').val().trim(),
-      path: $(this).find('.custom-root-path').val().trim()
+      path: $(this).find('.custom-root-path').val().trim(),
+      profiles: $(this).find('.custom-root-profile:checked').map(function(){ return $(this).val(); }).get()
     });
   });
   return rows;
@@ -217,22 +248,21 @@ $(function(){
       }
     }
   }
-  toggleCustomRootEditor();
   renderCustomRootItems();
-});
-
-$("body").on('change', '#custom_root_enabled', function(){
-  toggleCustomRootEditor();
 });
 
 $("body").on('input', '.custom-root-name, .custom-root-path', function(){
   syncCustomRootItems();
 });
 
+$("body").on('change', '.custom-root-profile', function(){
+  syncCustomRootItems();
+});
+
 $("body").on('click', '.add-item-btn', function(e){
   e.preventDefault();
   customRootItems = collectCustomRootItems();
-  customRootItems.push({name: '', path: ''});
+  customRootItems.push({name: '', path: '', profiles: ['profile_1', 'profile_2', 'profile_3', 'profile_4', 'profile_5']});
   renderCustomRootItems();
 });
 
@@ -277,6 +307,37 @@ $("body").on('click', '.select-custom-root-path-btn', function(e){
     syncCustomRootItems();
   });
 });
+
+document.addEventListener('click', function(e) {
+  const target = e.target.closest('#localSettingSaveBtn');
+  if (!target) return;
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+  syncCustomRootItems();
+  $.ajax({
+    url: '/' + PACKAGE_NAME + '/ajax/menu/command',
+    type: 'POST',
+    cache: false,
+    data: {
+      command: 'save_custom_root_items',
+      arg1: $('#custom_root_items').val(),
+      arg2: null,
+      arg3: null
+    },
+    dataType: 'json',
+    success: function(data) {
+      if (data.ret === 'success') {
+        $.notify('<strong>설정을 저장하였습니다.</strong>', {type: 'success'});
+      } else {
+        $.notify('<strong>설정 저장에 실패하였습니다.</strong><br>' + (data.msg || '알 수 없는 오류'), {type: 'warning'});
+      }
+    },
+    error: function(xhr) {
+      $.notify('<strong>설정 저장에 실패하였습니다.</strong><br>' + (xhr.responseText || 'request failed'), {type: 'warning'});
+    }
+  });
+}, true);
 </script>
 
 {% endblock %}

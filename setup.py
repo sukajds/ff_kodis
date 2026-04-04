@@ -12,8 +12,12 @@ setting = {
                 'name': '설정',
             },
             {
+                'uri': 'profile',
+                'name': '프로필',
+            },
+            {
                 'uri': 'menu',
-                'name': '목록',
+                'name': '목록 편집',
             },
             {
                 'uri': 'db',
@@ -45,8 +49,9 @@ try:
     from .kodis_auth import ModuleAuth
     from .kodis_db import ModuleDb
     from .kodis_menu import ModuleMenu
+    from .kodis_profile import ModuleProfile
     from .kodis_setting import ModuleSetting
-    P.set_module_list([ModuleAuth, ModuleSetting, ModuleMenu, ModuleDb])
+    P.set_module_list([ModuleAuth, ModuleSetting, ModuleProfile, ModuleMenu, ModuleDb])
 except Exception as e:
     P.logger.error(f'Exception:{str(e)}')
     P.logger.error(traceback.format_exc())

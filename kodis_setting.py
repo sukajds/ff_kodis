@@ -1,4 +1,4 @@
-import secrets
+import json
 import traceback
 
 from flask import jsonify, render_template
@@ -15,6 +15,9 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
         'ffmpeg_path': 'ffmpeg',
         'gds_path': '',
         'access_password': '',
+        'profiles_json': '[]',
+        'db_tree_schedule_enabled': 'False',
+        'db_tree_schedule': '',
         'show_av': 'False',
         'plex_db_path': '',
         'plex_import_since': '',
@@ -26,11 +29,16 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
 
     def __init__(self, P):
         super(ModuleSetting, self).__init__(P, name=name)
+        self._bootstrap_profiles_setting()
+        self._bootstrap_resume_migration()
         self._start_auto_meta_worker()
 
     def process_menu(self, page, req):
         self._remember_base_url_from_req(req)
         arg = P.ModelSetting.to_dict()
+        arg['profiles'] = self._load_profiles()
+        arg['profiles_json'] = json.dumps(arg['profiles'], ensure_ascii=False)
+        arg['db_tree_schedule_active'] = str(F.scheduler.is_include(self._db_tree_scheduler_job_id()))
         arg['package_name'] = P.package_name
         return render_template(f'{P.package_name}_{name}.html', arg=arg)
 
@@ -39,8 +47,12 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
         try:
             if command in ('list_root', 'list'):
                 return jsonify(self._list_items(req))
-            if command == 'generate_password':
-                return jsonify(self._generate_password())
+            if command == 'cleanup_deleted_profiles':
+                return jsonify(self._cleanup_deleted_profiles(arg1))
+            if command == 'sync_db_tree_schedule':
+                return jsonify(self._sync_db_tree_scheduler(arg1, arg2))
+            if command == 'build_db_tree_json_now':
+                return jsonify(self._build_db_tree_json_now())
             if command == 'ffmpeg_version':
                 return jsonify(self._ffmpeg_version())
             if command == 'transcode_capabilities':
@@ -62,6 +74,7 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
             if sub == 'auth':
                 self._require_api_key(req, allow_session=False, require_password=True)
                 return jsonify(self._auth_issue_session(req))
+            self._require_api_key(req, allow_session=True, require_password=True)
             return self._process_kodis_api(sub, req)
         except Exception as e:
             if getattr(e, 'code', None) in (401, 403, 404):
@@ -70,12 +83,31 @@ class ModuleSetting(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
             P.logger.error(traceback.format_exc())
             return jsonify({'ret': 'exception', 'msg': str(e)}), 500
 
-    def _generate_password(self):
-        generated = secrets.token_urlsafe(12)
-        P.ModelSetting.set('access_password', generated)
+    def _cleanup_deleted_profiles(self, payload):
+        deleted_ids = []
+        try:
+            parsed = json.loads(payload or '[]')
+            if isinstance(parsed, list):
+                deleted_ids = [str(item or '').strip() for item in parsed]
+        except Exception:
+            deleted_ids = []
+        deleted_total = 0
+        for profile_id in deleted_ids:
+            if not profile_id:
+                continue
+            deleted_total += int(self._delete_resume_profile(profile_id) or 0)
         return {
             'ret': 'success',
-            'msg': 'Access password generated',
-            'data': {'access_password': generated},
+            'msg': '삭제된 프로필 정리를 완료했습니다.',
+            'data': {'deleted_profiles': len([x for x in deleted_ids if x]), 'deleted_resume_rows': deleted_total},
         }
+
+    def plugin_load(self):
+        try:
+            self._bootstrap_profiles_setting()
+            self._bootstrap_resume_migration()
+            self._sync_db_tree_scheduler()
+        except Exception as e:
+            P.logger.error(f'Exception:{str(e)}')
+            P.logger.error(traceback.format_exc())
  
