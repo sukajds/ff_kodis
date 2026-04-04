@@ -883,10 +883,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             conn.commit()
         return deleted
 
-    def _should_hide_entry(self, current_rel, entry, req=None):
+    def _should_hide_entry(self, current_rel, entry, req=None, profile=None):
         if current_rel != '':
             return False
-        show_av = self._show_av_enabled(req=req)
+        show_av = self._show_av_enabled(req=req, profile=profile)
         if show_av:
             return False
         return entry.is_dir() and str(entry.name or '').strip().upper() == 'AV'
@@ -2936,9 +2936,10 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             raise Exception('target path is not a directory')
 
         items = []
+        request_profile = self._get_request_profile(req) if hasattr(self, '_get_request_profile') else None
         entries = self._run_with_timeout(
             'list_target_scandir',
-            lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry, req=req)],
+            lambda: [entry for entry in os.scandir(target) if not self._should_hide_entry(current_rel, entry, profile=request_profile)],
             timeout_seconds=8,
         )
         if self._is_recent_episode_sort_target(current_rel):
