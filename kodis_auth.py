@@ -98,13 +98,21 @@ class KodisAuthMixin(object):
         enabled = '1' if bool((profile or {}).get('enabled', True)) else '0'
         return '{}|{}|{}|{}'.format(system_apikey, profile_id, password, enabled)
 
+    def _resolve_request_object(self, req):
+        try:
+            return req._get_current_object()
+        except Exception:
+            return req
+
     def _set_request_profile(self, req, profile):
+        req = self._resolve_request_object(req)
         try:
             setattr(req, '_ff_profile', dict(profile or {}))
         except Exception:
             pass
 
     def _get_request_profile(self, req):
+        req = self._resolve_request_object(req)
         profile = getattr(req, '_ff_profile', None)
         return dict(profile or {}) if isinstance(profile, dict) else None
 
@@ -152,6 +160,7 @@ class KodisAuthMixin(object):
         return None
 
     def _request_value(self, req, *keys):
+        req = self._resolve_request_object(req)
         for key in keys:
             if hasattr(req, 'headers'):
                 value = req.headers.get(key)
@@ -282,6 +291,7 @@ class ModuleAuth(KodisAuthMixin, KodisPlayMixin, PluginModuleBase):
         self._bootstrap_resume_migration()
 
     def process_api(self, sub, req):
+        req = self._resolve_request_object(req)
         self._remember_base_url_from_req(req)
         try:
             if sub == 'auth':
