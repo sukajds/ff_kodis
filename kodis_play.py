@@ -35,6 +35,7 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
     auto_meta_base_url_lock = threading.Lock()
     auto_meta_base_url = ''
     auto_meta_poll_interval = 60
+    video_probe_cache = {}
     db_tree_worker_lock = threading.Lock()
     db_tree_worker_started = False
     db_tree_refresh_lock = threading.Lock()
@@ -3516,15 +3517,48 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
         return result
 
     def _probe_video(self, target, ffmpeg_path):
+        try:
+            stat = os.stat(target)
+            cache_key = (target, int(stat.st_mtime), int(stat.st_size))
+        except Exception:
+            stat = None
+            cache_key = (target, 0, 0)
+        cached = self.video_probe_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
         ffprobe_path = self._resolve_ffprobe_path(ffmpeg_path)
         cmd = [
             ffprobe_path, '-v', 'error', '-select_streams', 'v:0',
             '-show_entries', 'stream=width,height:format=duration',
             '-of', 'json', target
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        if proc.returncode != 0:
-            raise Exception(proc.stderr.strip() or 'ffprobe failed')
+        proc = None
+        last_error = None
+        for attempt, timeout_seconds in enumerate((20, 45), start=1):
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds, check=False)
+                if proc.returncode != 0:
+                    raise Exception(proc.stderr.strip() or 'ffprobe failed')
+                break
+            except subprocess.TimeoutExpired as err:
+                last_error = err
+                P.logger.warning(
+                    'ffprobe timeout attempt=%s timeout=%ss path=%s',
+                    attempt,
+                    timeout_seconds,
+                    target,
+                )
+                if attempt >= 2:
+                    raise
+            except Exception as err:
+                last_error = err
+                if attempt >= 2:
+                    raise
+        if proc is None:
+            if last_error is not None:
+                raise last_error
+            raise Exception('ffprobe failed')
         data = json.loads(proc.stdout or '{}')
         streams = data.get('streams') or []
         if not streams:
@@ -3535,11 +3569,18 @@ class KodisPlayMixin(KodisMetadataMixin, PlexImportMixin, object):
             duration = float((data.get('format') or {}).get('duration') or 0)
         except Exception:
             duration = 0.0
-        return {
+        result = {
             'width': int(stream.get('width') or 0),
             'height': int(stream.get('height') or 0),
             'duration': duration,
         }
+        if len(self.video_probe_cache) > 256:
+            try:
+                self.video_probe_cache.pop(next(iter(self.video_probe_cache)))
+            except Exception:
+                self.video_probe_cache = {}
+        self.video_probe_cache[cache_key] = dict(result)
+        return result
 
     def _resolve_ffprobe_path(self, ffmpeg_path):
         dirname = os.path.dirname(ffmpeg_path)
@@ -4191,4 +4232,3 @@ for _metadata_method_name in (
 
 
  
-
